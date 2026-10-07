@@ -1,489 +1,264 @@
-import { createPublicClient, http } from 'viem';
+/**
+ * Stellar event indexer: polls RPC getEvents for the four OracleDesk
+ * contracts, stores each event once (keyed by its RPC event id), applies
+ * side effects, and emits socket.io events.
+ *
+ * - The ledger cursor is persisted in Postgres (indexer_cursors), so a
+ *   restart resumes where it stopped.
+ * - RPC only retains a short window of events. If the cursor is older than
+ *   the oldest ledger RPC still has, we log a warning and resume from there;
+ *   anything in between is lost to this indexer.
+ * - Event shapes come from each binding's contract spec (Spec.parseEvent),
+ *   never hand-written XDR decoding.
+ */
+import { rpc, xdr } from '@stellar/stellar-sdk';
+import type { Spec } from '@stellar/stellar-sdk/contract';
+import { Prisma } from '@prisma/client';
+import { config } from '../config';
+import { CONTRACTS } from '../config/contracts';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
-import { config } from '../config';
-import {
-  CONTRACT_ADDRESSES,
-  MARKET_FACTORY_ABI,
-  MULTISIG_ORACLE_ABI,
-  POSITION_LEDGER_ABI,
-  REASONING_REGISTRY_ABI,
-} from '../config/contracts';
+import { readClients, rpcServer } from './stellar/clients';
+import { printable } from './chain.service';
+import { priceYesBps } from '../generated/fpmm';
 
-const arcChain = {
-  id: config.ARC_CHAIN_ID,
-  name: 'Arc Testnet',
-  network: 'arc-testnet',
-  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-  rpcUrls: { default: { http: [config.ARC_RPC_URL] } },
-} as const;
+export type EventSource = Pick<rpc.Server, 'getEvents' | 'getHealth'>;
 
-const publicClient = createPublicClient({
-  chain: arcChain as any,
-  transport: http(config.ARC_RPC_URL),
-});
-
-// ─── Block-index write debounce ───────────────────────────────────────────────
-// Only write to block_index every WRITE_EVERY_N_BATCHES batches during backfill,
-// and always write on the very last batch.  The live watcher uses a time-based
-// debounce so it never writes more than once per WATCHER_DEBOUNCE_MS.
-
-const WRITE_EVERY_N_BATCHES = 500;
-const WATCHER_DEBOUNCE_MS   = 30_000;
-
-let _watcherWriteTimer: ReturnType<typeof setTimeout> | null = null;
-let _pendingWatcherBlock: bigint | null = null;
-
-async function persistBlockIndex(blockNumber: bigint): Promise<void> {
-  await prisma.blockIndex.upsert({
-    where:  { chainId: config.ARC_CHAIN_ID },
-    create: { chainId: config.ARC_CHAIN_ID, lastBlockNumber: blockNumber },
-    update: { lastBlockNumber: blockNumber },
-  });
+export interface IndexerDeps {
+  source: EventSource;
+  /** Called for each newly stored event that should reach clients. */
+  emit: (event: string, payload: unknown) => void;
 }
 
-function scheduleDebouncedBlockWrite(blockNumber: bigint): void {
-  _pendingWatcherBlock = blockNumber;
-  if (_watcherWriteTimer) return;
-  _watcherWriteTimer = setTimeout(async () => {
-    _watcherWriteTimer = null;
-    if (_pendingWatcherBlock !== null) {
-      await persistBlockIndex(_pendingWatcherBlock).catch(err =>
-        logger.error({ err }, 'Failed to persist debounced block index'),
-      );
-      _pendingWatcherBlock = null;
-    }
-  }, WATCHER_DEBOUNCE_MS);
+const PAGE_LIMIT = 200;
+export const CURSOR_ID = `stellar:${config.STELLAR_NETWORK_PASSPHRASE}`;
+
+type ContractName = 'marketCore' | 'treasury' | 'resolver' | 'reasoningRegistry';
+
+function specs(): Map<string, { name: ContractName; spec: Spec }> {
+  return new Map<string, { name: ContractName; spec: Spec }>([
+    [CONTRACTS.marketCore, { name: 'marketCore', spec: readClients.marketCore().spec }],
+    [CONTRACTS.treasury, { name: 'treasury', spec: readClients.treasury().spec }],
+    [CONTRACTS.resolver, { name: 'resolver', spec: readClients.resolver().spec }],
+    [CONTRACTS.reasoningRegistry, { name: 'reasoningRegistry', spec: readClients.reasoningRegistry().spec }],
+  ]);
 }
 
-// ─── Live event watcher ───────────────────────────────────────────────────────
-//
-// WHY NOT watchContractEvent?
-//
-// viem's watchContractEvent({ poll: true }) internally calls eth_newFilter to
-// create a server-side filter, then polls it with eth_getFilterChanges.  Most
-// hosted/testnet RPC nodes (including Arc testnet) expire these filters after
-// just a few minutes, which causes a "filter not found" (-32602) error on every
-// poll tick.  This floods the logs with ERROR entries and silently stops
-// indexing new events.
-//
-// FIX: Use a manual polling loop that calls getContractEvents (which maps to
-// eth_getLogs) with an explicit fromBlock/toBlock range.  eth_getLogs is
-// stateless — no server-side filter is created or expired.  This is reliable
-// on every EVM node that supports standard JSON-RPC.
-//
-// POLLING INTERVAL: 4 seconds.  Arc block time is ~2s; polling every 4s means
-// we process each block within 2–6 seconds of it being mined.
+export interface DecodedEvent {
+  id: string;
+  contractId: string;
+  contractName: ContractName;
+  eventName: string;
+  ledger: number;
+  ledgerClosedAt: string;
+  txHash: string;
+  params: Record<string, any>;
+}
 
-export function startEventListener(): () => void {
-  if (isZeroAddress(CONTRACT_ADDRESSES.marketFactory)) {
-    logger.warn('MarketFactory address not configured; event indexer disabled');
-    return () => {};
-  }
-
-  let stopped = false;
-  let lastPolledBlock: bigint | null = null;
-
-  const POLL_INTERVAL_MS  = 4_000;
-  const MAX_BLOCKS_PER_POLL = BigInt(20); // ~40 seconds of blocks per tick
-
-  const pollLoop = async (): Promise<void> => {
-    while (!stopped) {
-      try {
-        const currentBlock = await publicClient.getBlockNumber();
-
-        // Initialise lastPolledBlock from the DB checkpoint on first tick
-        if (lastPolledBlock === null) {
-          const blockIndex = await prisma.blockIndex.findUnique({
-            where: { chainId: config.ARC_CHAIN_ID },
-          });
-          // Start from 1 block behind current so we don't miss the very latest
-          lastPolledBlock = blockIndex?.lastBlockNumber ?? currentBlock - BigInt(1);
-        }
-
-        if (currentBlock <= lastPolledBlock) {
-          await sleep(POLL_INTERVAL_MS);
-          continue;
-        }
-
-        // Clamp the window so a single tick never fetches thousands of blocks
-        const fromBlock = lastPolledBlock + BigInt(1);
-        const toBlock   = fromBlock + MAX_BLOCKS_PER_POLL - BigInt(1) < currentBlock
-          ? fromBlock + MAX_BLOCKS_PER_POLL - BigInt(1)
-          : currentBlock;
-
-        const [marketLogs, reasoningLogs, positionLogs, resolutionLogs] = await Promise.all([
-          publicClient.getContractEvents({
-            address:   CONTRACT_ADDRESSES.marketFactory as `0x${string}`,
-            abi:       MARKET_FACTORY_ABI,
-            eventName: 'MarketDeployed',
-            fromBlock,
-            toBlock,
-          }),
-          publicClient.getContractEvents({
-            address:   CONTRACT_ADDRESSES.reasoningRegistry as `0x${string}`,
-            abi:       REASONING_REGISTRY_ABI,
-            eventName: 'ReasoningPublished',
-            fromBlock,
-            toBlock,
-          }),
-          publicClient.getContractEvents({
-            address:   CONTRACT_ADDRESSES.positionLedger as `0x${string}`,
-            abi:       POSITION_LEDGER_ABI,
-            eventName: 'PositionOpened',
-            fromBlock,
-            toBlock,
-          }),
-          publicClient.getContractEvents({
-            address:   CONTRACT_ADDRESSES.multiSigOracle as `0x${string}`,
-            abi:       MULTISIG_ORACLE_ABI,
-            eventName: 'MarketResolved',
-            fromBlock,
-            toBlock,
-          }),
-        ]);
-
-        for (const log of marketLogs)    await handleMarketDeployed(log as any).catch(logError);
-        for (const log of reasoningLogs) await handleRegistryReasoningPublished(log as any).catch(logError);
-        for (const log of positionLogs)  await handlePositionOpened(log as any).catch(logError);
-        for (const log of resolutionLogs) await handleMarketResolved(log as any).catch(logError);
-
-        lastPolledBlock = toBlock;
-
-        if (marketLogs.length + reasoningLogs.length + positionLogs.length + resolutionLogs.length > 0) {
-          scheduleDebouncedBlockWrite(toBlock);
-        }
-
-      } catch (err: any) {
-        // Log and back off — don't crash the whole watcher on a transient RPC error
-        logger.warn({ err: err?.message?.slice(0, 200) }, 'Live event poll error — retrying in 10s');
-        await sleep(10_000);
-        continue;
-      }
-
-      await sleep(POLL_INTERVAL_MS);
-    }
-  };
-
-  // Start the loop — errors inside the loop are caught; we only log a fatal
-  // error if the loop itself throws unexpectedly (it shouldn't).
-  pollLoop().catch(err => logger.error({ err }, 'Live event poll loop terminated unexpectedly'));
-
-  logger.info('Blockchain event indexer started');
-
-  return () => {
-    stopped = true;
-    if (_watcherWriteTimer) clearTimeout(_watcherWriteTimer);
+/** Decodes one RPC event with its contract's spec; null for unknown events. */
+export function decodeEvent(event: rpc.Api.EventResponse, known = specs()): DecodedEvent | null {
+  const contractId = event.contractId?.contractId();
+  if (!contractId) return null;
+  const entry = known.get(contractId);
+  if (!entry) return null;
+  const parsed = entry.spec.parseEvent(event.topic as xdr.ScVal[], event.value);
+  if (!parsed) return null;
+  return {
+    id: event.id,
+    contractId,
+    contractName: entry.name,
+    eventName: parsed.name,
+    ledger: event.ledger,
+    ledgerClosedAt: event.ledgerClosedAt,
+    txHash: event.txHash,
+    params: parsed.data,
   };
 }
 
-// ─── Backfill ─────────────────────────────────────────────────────────────────
-export async function backfillEvents(fromBlock?: bigint): Promise<void> {
-  if (isZeroAddress(CONTRACT_ADDRESSES.marketFactory)) {
-    logger.warn('MarketFactory address not configured; skipping backfill');
+/** Stores an event; returns false if it was already stored (idempotent). */
+async function store(event: DecodedEvent): Promise<boolean> {
+  try {
+    await prisma.chainEvent.create({
+      data: {
+        id: event.id,
+        contractId: event.contractId,
+        contractName: event.contractName,
+        eventName: event.eventName,
+        ledger: event.ledger,
+        ledgerClosedAt: new Date(event.ledgerClosedAt),
+        txHash: event.txHash,
+        params: printable(event.params) as Prisma.InputJsonValue,
+      },
+    });
+    return true;
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') return false;
+    throw err;
+  }
+}
+
+const outcomeTag = (o: unknown): 'Yes' | 'No' | null =>
+  o && typeof o === 'object' && 'tag' in o ? ((o as { tag: 'Yes' | 'No' }).tag) : null;
+
+async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']): Promise<void> {
+  const p = event.params;
+
+  if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
+    const onChainMarketId = BigInt(p.market_id);
+    const yesBps = Number(priceYesBps(BigInt(p.reserve_yes), BigInt(p.reserve_no)));
+    const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true, question: true } });
+    if (market) {
+      await prisma.market.update({ where: { id: market.id }, data: { currentYesProb: yesBps / 10_000 } });
+    }
+    emit('TRADE_EXECUTED', {
+      onChainMarketId: onChainMarketId.toString(),
+      marketId: market?.id ?? null,
+      marketQuestion: market?.question ?? null,
+      trader: p.trader,
+      direction: outcomeTag(p.outcome) === 'No' ? 'NO' : 'YES',
+      isBuy: Boolean(p.is_buy),
+      collateralRaw: String(p.collateral),
+      sharesRaw: String(p.shares),
+      feeRaw: String(p.fee),
+      priceYesBps: yesBps,
+      txHash: event.txHash,
+      ledger: event.ledger,
+      eventId: event.id,
+    });
     return;
   }
 
-  const blockIndex = await prisma.blockIndex.findUnique({
-    where: { chainId: config.ARC_CHAIN_ID },
+  if (event.contractName === 'marketCore' && event.eventName === 'MarketResolved') {
+    const onChainMarketId = BigInt(p.market_id);
+    const outcome = outcomeTag(p.outcome); // null: the market was voided
+    const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true } });
+    if (!market) return;
+    await prisma.$transaction([
+      prisma.market.update({
+        where: { id: market.id },
+        data: {
+          status: outcome ? 'RESOLVED' : 'CANCELLED',
+          resolvedOutcome: outcome ? outcome === 'Yes' : null,
+          resolvedAt: new Date(event.ledgerClosedAt),
+        },
+      }),
+      prisma.position.updateMany({
+        where: { marketId: market.id, status: 'OPEN' },
+        data: { status: 'CLOSED', closedAt: new Date(event.ledgerClosedAt), closeReason: outcome ? `${outcome.toUpperCase()}_RESOLVED` : 'VOIDED' },
+      }),
+    ]);
+    return;
+  }
+
+  if (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished') {
+    const traceHash = Buffer.from(p.trace_hash).toString('hex');
+    const onChainTraceId = BigInt(p.trace_id);
+    const trace = await prisma.reasoningTrace.findFirst({ where: { traceHash }, select: { id: true, onChainTraceId: true } });
+    if (trace && trace.onChainTraceId === null) {
+      await prisma.reasoningTrace.update({
+        where: { id: trace.id },
+        data: { onChainTraceId, publishTxHash: event.txHash },
+      });
+    }
+    emit('REASONING_PUBLISHED', {
+      onChainTraceId: onChainTraceId.toString(),
+      onChainMarketId: String(p.market_id),
+      traceId: trace?.id ?? null,
+      agent: p.agent,
+      action: p.action,
+      ipfsCid: p.ipfs_cid,
+      traceHash,
+      txHash: event.txHash,
+      ledger: event.ledger,
+    });
+  }
+}
+
+async function readCursor(): Promise<number | null> {
+  const row = await prisma.indexerCursor.findUnique({ where: { id: CURSOR_ID } });
+  return row ? row.lastLedger : null;
+}
+
+async function writeCursor(lastLedger: number): Promise<void> {
+  await prisma.indexerCursor.upsert({
+    where: { id: CURSOR_ID },
+    create: { id: CURSOR_ID, lastLedger },
+    update: { lastLedger },
   });
+}
 
-  const startBlock   = fromBlock ?? ((blockIndex?.lastBlockNumber ?? BigInt(0)) + BigInt(1));
-  const currentBlock = await publicClient.getBlockNumber();
+/**
+ * Indexes from `fromLedger` (default: the stored cursor + 1, or the oldest
+ * ledger RPC retains) up to the latest ledger. Returns counts.
+ */
+export async function backfillEvents(
+  fromLedger?: number,
+  deps: IndexerDeps = { source: rpcServer, emit: () => undefined },
+): Promise<{ startLedger: number; lastLedger: number; seen: number; stored: number }> {
+  const health = await deps.source.getHealth();
+  const cursor = await readCursor();
+  let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
 
-  if (startBlock > currentBlock) {
-    logger.info({ startBlock, currentBlock }, 'Backfill already up to date');
-    return;
+  if (startLedger < health.oldestLedger) {
+    logger.warn(
+      { requested: startLedger, oldestAvailable: health.oldestLedger },
+      'Indexer cursor is older than RPC retention; resuming from the oldest available ledger. Events in between are not indexed.',
+    );
+    startLedger = health.oldestLedger;
+  }
+  if (startLedger > health.latestLedger) {
+    return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
   }
 
-  const batchSize    = BigInt(500);
-  const totalBlocks  = currentBlock - startBlock;
-  const totalBatches = Number(totalBlocks / batchSize) + 1;
+  const known = specs();
+  const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
+  let seen = 0;
+  let stored = 0;
+  let latestLedger = health.latestLedger;
+  let page = await deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT });
 
-  logger.info({ startBlock, currentBlock, totalBatches }, 'Starting event backfill');
-
-  let batchCount = 0;
-
-  for (let block = startBlock; block <= currentBlock; block += batchSize) {
-    const toBlock = block + batchSize - BigInt(1) < currentBlock
-      ? block + batchSize - BigInt(1)
-      : currentBlock;
-
-    try {
-      const [marketLogs, reasoningLogs, positionLogs, resolutionLogs] = await Promise.all([
-        publicClient.getContractEvents({
-          address:   CONTRACT_ADDRESSES.marketFactory as `0x${string}`,
-          abi:       MARKET_FACTORY_ABI,
-          eventName: 'MarketDeployed',
-          fromBlock: block,
-          toBlock,
-        }),
-        publicClient.getContractEvents({
-          address:   CONTRACT_ADDRESSES.reasoningRegistry as `0x${string}`,
-          abi:       REASONING_REGISTRY_ABI,
-          eventName: 'ReasoningPublished',
-          fromBlock: block,
-          toBlock,
-        }),
-        publicClient.getContractEvents({
-          address:   CONTRACT_ADDRESSES.positionLedger as `0x${string}`,
-          abi:       POSITION_LEDGER_ABI,
-          eventName: 'PositionOpened',
-          fromBlock: block,
-          toBlock,
-        }),
-        publicClient.getContractEvents({
-          address:   CONTRACT_ADDRESSES.multiSigOracle as `0x${string}`,
-          abi:       MULTISIG_ORACLE_ABI,
-          eventName: 'MarketResolved',
-          fromBlock: block,
-          toBlock,
-        }),
-      ]);
-
-      for (const log of marketLogs)    await handleMarketDeployed(log as any).catch(logError);
-      for (const log of reasoningLogs) await handleRegistryReasoningPublished(log as any).catch(logError);
-      for (const log of positionLogs)  await handlePositionOpened(log as any).catch(logError);
-      for (const log of resolutionLogs) await handleMarketResolved(log as any).catch(logError);
-
-      batchCount++;
-
-      const isFinalBatch = toBlock >= currentBlock;
-      if (batchCount % WRITE_EVERY_N_BATCHES === 0 || isFinalBatch) {
-        await persistBlockIndex(toBlock);
-        logger.debug(
-          { batchCount, totalBatches, toBlock: toBlock.toString() },
-          'Block index checkpoint saved',
+  for (;;) {
+    latestLedger = page.latestLedger;
+    for (const raw of page.events) {
+      seen++;
+      const decoded = decodeEvent(raw, known);
+      if (!decoded) continue;
+      if (await store(decoded)) {
+        stored++;
+        await applySideEffects(decoded, deps.emit).catch((err) =>
+          logger.error({ err, eventId: decoded.id }, 'Indexer side effect failed'),
         );
       }
-
-    } catch (err) {
-      logger.error({ err, fromBlock: block, toBlock }, 'Backfill batch failed');
     }
+    if (page.events.length < PAGE_LIMIT) break;
+    page = await deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT });
   }
 
-  logger.info('Event backfill complete');
+  await writeCursor(latestLedger);
+  if (stored > 0) logger.info({ startLedger, lastLedger: latestLedger, seen, stored }, 'Indexed Stellar events');
+  return { startLedger, lastLedger: latestLedger, seen, stored };
 }
 
-// ─── Event handlers ───────────────────────────────────────────────────────────
-
-async function handleMarketDeployed(log: any): Promise<void> {
-  const { market, question, oracle, expiryTimestamp, initialYesPrice, liquiditySeed, reasoningCid } = log.args ?? {};
-  const txHash = log.transactionHash;
-
-  if (!market || !txHash) return;
-
-  const existing = await prisma.market.findFirst({
-    where: { OR: [{ onChainAddress: String(market) }, { txHash: String(txHash) }] },
-  });
-  if (existing) return;
-
-  const pendingMarket = await prisma.market.findFirst({
-    where: {
-      status: 'PENDING',
-      OR: [
-        { question: { equals: String(question ?? '') } },
-        ...(reasoningCid ? [{ reasoningTraces: { some: { ipfsCid: String(reasoningCid) } } }] : []),
-      ],
-    },
-    orderBy: { createdAt: 'desc' },
-  });
-
-  const initialProbability = Number(initialYesPrice ?? 5000) / 10_000;
-  const liquidityUsdc      = Number(liquiditySeed ?? 0) / 1_000_000;
-
-  if (pendingMarket) {
-    await prisma.market.update({
-      where: { id: pendingMarket.id },
-      data: {
-        status:           'ACTIVE',
-        onChainAddress:   String(market),
-        txHash:           String(txHash),
-        resolutionOracle: String(oracle ?? pendingMarket.resolutionOracle ?? ''),
-        totalLiquidity:   liquidityUsdc || pendingMarket.totalLiquidity,
-      },
-    });
-  } else {
-    await prisma.market.create({
-      data: {
-        question:           String(question ?? `On-chain market ${market}`),
-        category:           'MACRO',
-        status:             'ACTIVE',
-        initialYesProb:     clampProbability(initialProbability),
-        currentYesProb:     clampProbability(initialProbability),
-        confidenceInterval: {
-          lower: Math.max(0.01, clampProbability(initialProbability) - 0.1),
-          upper: Math.min(0.99, clampProbability(initialProbability) + 0.1),
-        } as any,
-        expiryTimestamp:    new Date(Number(expiryTimestamp ?? 0) * 1000 || Date.now()),
-        resolutionOracle:   String(oracle ?? ''),
-        minimumLiquidity:   liquidityUsdc || 100,
-        totalLiquidity:     liquidityUsdc,
-        onChainAddress:     String(market),
-        txHash:             String(txHash),
-      },
-    });
+/** Polls every INDEXER_POLL_MS. Returns a stop function. */
+export function startEventListener(emit: IndexerDeps['emit']): () => void {
+  if (!config.INDEXER_ENABLED) {
+    logger.warn('INDEXER_ENABLED=false; Stellar event indexer disabled');
+    return () => undefined;
   }
-
-  await prisma.agentLog.create({
-    data: {
-      agentType: 'MARKET_MAKER',
-      level:     'INFO',
-      action:    'MARKET_DEPLOYED_INDEXED',
-      data:      { market, question, oracle, expiryTimestamp: String(expiryTimestamp ?? ''), txHash },
-    },
-  });
+  let stopped = false;
+  let timer: NodeJS.Timeout | null = null;
+  const tick = async () => {
+    try {
+      await backfillEvents(undefined, { source: rpcServer, emit });
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
+    }
+    if (!stopped) timer = setTimeout(tick, config.INDEXER_POLL_MS);
+  };
+  void tick();
+  logger.info({ pollMs: config.INDEXER_POLL_MS }, 'Stellar event indexer started');
+  return () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+  };
 }
-
-async function handleRegistryReasoningPublished(log: any): Promise<void> {
-  const { traceId, agentWallet, ipfsCid, sha256Hash, traceType, relatedId, blockTimestamp } = log.args ?? {};
-  const txHash = log.transactionHash;
-  if (!ipfsCid || !txHash) return;
-
-  const trace = await prisma.reasoningTrace.findFirst({
-    where: {
-      OR: [
-        { ipfsCid: String(ipfsCid) },
-        { sha256Hash: normalizeBytes32Hash(sha256Hash) },
-      ],
-    },
-  });
-
-  if (trace && trace.onChainTxHash !== String(txHash)) {
-    await prisma.reasoningTrace.update({
-      where: { id: trace.id },
-      data: {
-        onChainTxHash: String(txHash),
-        verified:      true,
-        agentWallet:   String(agentWallet ?? trace.agentWallet ?? ''),
-      },
-    });
-  }
-
-  await prisma.agentLog.create({
-    data: {
-      agentType: trace?.agentType ?? 'TRADER',
-      level:     'INFO',
-      action:    'REASONING_PUBLISHED_INDEXED',
-      marketId:  trace?.marketId,
-      data: {
-        traceId:        String(traceId ?? ''),
-        ipfsCid:        String(ipfsCid),
-        sha256Hash:     normalizeBytes32Hash(sha256Hash),
-        traceType:      String(traceType ?? ''),
-        relatedId:      String(relatedId ?? ''),
-        blockTimestamp: String(blockTimestamp ?? ''),
-        txHash,
-      },
-    },
-  });
-}
-
-async function handlePositionOpened(log: any): Promise<void> {
-  const { positionId, conditionId, tokenId, side, usdcSpent, entryPriceBps, edgeBps, reasoningCid, sha256Hash, polygonTxHash } = log.args ?? {};
-  const txHash = String(log.transactionHash ?? polygonTxHash ?? '');
-  if (!positionId || !txHash) return;
-
-  const trace = await prisma.reasoningTrace.findFirst({
-    where: {
-      OR: [
-        ...(reasoningCid ? [{ ipfsCid: String(reasoningCid) }] : []),
-        { sha256Hash: normalizeBytes32Hash(sha256Hash) },
-      ],
-    },
-    include: { market: true },
-  });
-
-  if (!trace) {
-    logger.warn({ positionId: String(positionId), txHash }, 'PositionOpened had no matching reasoning trace');
-    return;
-  }
-
-  const existingTrade = await prisma.trade.findFirst({ where: { txHash } });
-  if (existingTrade) return;
-
-  const direction = Number(side ?? 0) === 0 ? 'YES' : 'NO';
-  const amount    = Number(usdcSpent ?? 0) / 1_000_000;
-  const price     = Number(entryPriceBps ?? 0) / 10_000;
-  const edge      = Number(edgeBps ?? 0) / 10_000;
-
-  const trade = await prisma.trade.create({
-    data: {
-      marketId:      trace.marketId,
-      direction,
-      status:        'EXECUTED',
-      amount,
-      price:         clampProbability(price || trace.market.currentYesProb || trace.market.initialYesProb),
-      edgeDetected:  edge,
-      kellyFraction: trace.betFraction ?? 0,
-      txHash,
-      executedAt:    new Date(),
-    },
-  });
-
-  await prisma.position.create({
-    data: {
-      marketId:     trace.marketId,
-      tradeId:      trade.id,
-      direction,
-      status:       'OPEN',
-      entryPrice:   trade.price,
-      currentPrice: trade.price,
-      size:         amount,
-      pnl:          0,
-    },
-  });
-
-  await prisma.agentLog.create({
-    data: {
-      agentType: 'TRADER',
-      level:     'INFO',
-      action:    'POSITION_OPENED_INDEXED',
-      marketId:  trace.marketId,
-      data: {
-        positionId:   String(positionId),
-        conditionId:  String(conditionId ?? ''),
-        tokenId:      String(tokenId ?? ''),
-        reasoningCid: String(reasoningCid ?? ''),
-        txHash,
-      },
-    },
-  });
-}
-
-async function handleMarketResolved(log: any): Promise<void> {
-  const { market, yesWon } = log.args ?? {};
-  const txHash = log.transactionHash;
-  if (!market) return;
-
-  const existing = await prisma.market.findFirst({
-    where: { onChainAddress: { equals: String(market), mode: 'insensitive' } },
-  });
-  if (!existing || existing.status === 'RESOLVED') return;
-
-  await prisma.market.update({
-    where: { id: existing.id },
-    data: {
-      status:          'RESOLVED',
-      resolvedOutcome: Boolean(yesWon),
-      resolvedAt:      new Date(),
-    },
-  });
-
-  await prisma.agentLog.create({
-    data: {
-      agentType: 'MARKET_MAKER',
-      level:     'INFO',
-      action:    'MARKET_RESOLVED_INDEXED',
-      marketId:  existing.id,
-      data:      { market: String(market), yesWon: Boolean(yesWon), txHash } as any,
-    },
-  });
-}
-
-// ─── Utilities ────────────────────────────────────────────────────────────────
-const sleep          = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-const isZeroAddress  = (addr: string) => !addr || addr === '0x0000000000000000000000000000000000000000';
-const clampProbability = (value: number) => Math.min(0.99, Math.max(0.01, value));
-const normalizeBytes32Hash = (value: unknown) => String(value ?? '').replace(/^0x/, '').toLowerCase();
-const logError = (err: unknown) => logger.error({ err }, 'Event handler error');

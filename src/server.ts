@@ -6,7 +6,8 @@ import { logger } from './lib/logger';
 import { prisma } from './lib/prisma';
 import { startIngestionCron } from './cron/ingestion.cron';
 import { startMonitorCron } from './cron/monitor.cron';
-import { startEventListener, backfillEvents } from './services/indexer.service';
+import { startEventListener } from './services/indexer.service';
+import { closeRedis } from './lib/redis';
 
 let stopEventListener: (() => void) | null = null;
 
@@ -20,26 +21,29 @@ async function bootstrap(): Promise<void> {
     process.exit(1);
   }
 
-  // 2. Backfill blockchain events missed during downtime
-  backfillEvents().catch((err) => {
-    logger.warn({ err }, 'Backfill failed');
+  if (config.ephemeralSecrets.length > 0) {
+    logger.warn(
+      { generated: config.ephemeralSecrets },
+      'Generated ephemeral secrets for this process; sessions and challenges end on restart. Set them in .env.',
+    );
+  }
+  logger.info({ mode: config.CHAIN_EXECUTION_MODE }, 'Chain execution mode');
+
+  // 2. Start HTTP server with Socket.io
+  const server = http.createServer(app);
+  const io = new Server(server, {
+    cors: {
+      origin: config.CORS_ORIGINS,
+      methods: ['GET', 'POST'],
+    },
   });
 
-  // 3. Start real-time event listener
-  stopEventListener = startEventListener();
+  // 3. Index Stellar events (resumes from the stored ledger cursor)
+  stopEventListener = startEventListener((event, payload) => io.emit(event, payload));
 
   // 4. Start cron jobs
   startIngestionCron();
   startMonitorCron();
-
-  // 5. Start HTTP server with Socket.io
-  const server = http.createServer(app);
-  const io = new Server(server, {
-    cors: {
-      origin: '*', // In production, restrict this to your frontend URL
-      methods: ['GET', 'POST'],
-    },
-  });
 
   io.on('connection', (socket) => {
     logger.info({ socketId: socket.id }, 'New client connected to socket.io');
@@ -67,6 +71,7 @@ async function bootstrap(): Promise<void> {
       if (stopEventListener) stopEventListener();
 
       await prisma.$disconnect();
+      await closeRedis();
       logger.info('Database disconnected');
       process.exit(0);
     });
