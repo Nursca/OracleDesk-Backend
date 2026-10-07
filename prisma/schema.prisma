@@ -34,9 +34,10 @@ enum MarketCategory {
   POLITICS
 }
 
+/// market-core takes a single collateral token (USDC). EURC was dropped in the
+/// Stellar port; see docs/api.md.
 enum SettlementCurrency {
   USDC
-  EURC
 }
 
 enum TradeDirection {
@@ -104,7 +105,7 @@ model User {
   @@map("users")
 }
 
-/// AI-generated prediction markets deployed on Arc
+/// AI-generated prediction markets, created on Stellar through the treasury contract
 model Market {
   id                 String             @id @default(uuid())
   question           String
@@ -120,8 +121,18 @@ model Market {
   resolvedAt         DateTime?
   minimumLiquidity   Float              @default(100)
   totalLiquidity     Float              @default(0)
-  onChainAddress     String?            @unique
-  txHash             String?
+  /// market-core u64 market id. Serialised as a decimal string in JSON.
+  onChainMarketId    BigInt?            @unique
+  creationTxHash     String?
+  /// Seed liquidity in 7-decimal USDC base units.
+  seedAmountRaw      String?
+  /// sha256 (hex) of the canonical question JSON pinned at metaUri.
+  questionHash       String?
+  metaUri            String?
+  /// sha256(XDR(ResolutionSpec)) committed on-chain at creation (ADR 0001).
+  resolutionHash     String?
+  /// Revealed preimage of resolutionHash, kept so it can be registered with the resolver.
+  resolutionSpec     Json?
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
 
@@ -226,8 +237,11 @@ model ReasoningTrace {
   agentWallet         String?
   signature           String?
   ipfsCid             String?
-  sha256Hash          String?
-  onChainTxHash       String?
+  /// sha256 (hex) of the exact bytes pinned to IPFS.
+  traceHash           String?
+  /// reasoning-registry u64 trace id.
+  onChainTraceId      BigInt?   @unique
+  publishTxHash       String?
   verified            Boolean   @default(false)
   isPublic            Boolean   @default(false)
   previewSources      Json?     // First 2 sources (free preview)
@@ -254,6 +268,7 @@ model CopyTrade {
   tradeId    String?
   direction  TradeDirection
   amount     Float
+  amountRaw  String?
   txHash     String?
   builderFee Float          @default(0)
   status     TradeStatus    @default(PENDING)
@@ -327,15 +342,33 @@ model SignalCache {
   @@map("signal_cache")
 }
 
-/// Tracks last processed block per chain for the event indexer
-model BlockIndex {
-  id              String   @id @default(uuid())
-  chainId         Int
-  lastBlockNumber BigInt   @default(0)
-  updatedAt       DateTime @updatedAt
+/// Ledger cursor for the Stellar event indexer, one row per network.
+model IndexerCursor {
+  id         String   @id
+  lastLedger Int      @default(0)
+  updatedAt  DateTime @updatedAt
 
-  @@unique([chainId])
-  @@map("block_index")
+  @@map("indexer_cursors")
+}
+
+/// Contract events read from Stellar RPC getEvents. `id` is the RPC event id,
+/// so re-reading a ledger range never inserts duplicates.
+model ChainEvent {
+  id             String   @id
+  contractId     String
+  contractName   String
+  eventName      String
+  ledger         Int
+  ledgerClosedAt DateTime
+  txHash         String
+  /// Decoded event params (bigints as strings).
+  params         Json
+  createdAt      DateTime @default(now())
+
+  @@index([contractName, eventName])
+  @@index([ledger])
+  @@index([txHash])
+  @@map("chain_events")
 }
 
 // Event emitted for every payment transaction related to subscriptions and copy trading
@@ -345,6 +378,8 @@ model PaymentEvent {
   txHash        String   @unique
   type          String   // DAILY_PASS | PER_TRACE | REFUND
   amount        Float
+  amountRaw     String?
+  fromAddress   String?
   currency      String   @default("USDC")
   status        String   // PENDING | CONFIRMED | FAILED
   traceId       String?
