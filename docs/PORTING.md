@@ -18,7 +18,7 @@ and then by reading each file. The Soroban contracts in
 | `src/services/circle.service.ts` | Circle Developer-Controlled Wallets: contract execution on Arc, webhook signature checks, transaction lookup for payment verification. |
 | `src/controllers/webhook.controller.ts` + its two routes in `src/app.ts` | Circle webhook receiver. |
 | `src/services/polymarket.service.ts` | Polymarket CLOB order signing with `ethers`. |
-| `src/services/hedging.service.ts` | Only used by the trader agent; its `autoHedge` opens offsetting positions through the same EVM trade path. Kept as pure DB/risk logic where it doesn't execute (see "Rewrite"). |
+| ~~`src/services/hedging.service.ts`~~ | **Kept** after reading it: it is pure database/risk logic (stop-loss, drawdown, hedge suggestions) with no chain or Polymarket calls. Its `autoHedge` only writes PENDING trade rows, which nothing executes; recorded as a backlog item. |
 | `tests/payment-chain-oracle.test.ts` | Tests Circle webhooks, mock EVM hashes, the dev-mode payment bypass and the open resolve endpoint, all of which are removed. Replaced by Stellar tests. |
 
 ## Rewrite

@@ -2,67 +2,48 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
-import rateLimit from 'express-rate-limit';
 import morgan from 'morgan';
 import hpp from 'hpp';
 
 import { config } from './config';
 import { logger } from './lib/logger';
 import { errorMiddleware } from './middlewares/error.middleware';
+import { globalLimiter } from './middlewares/rate-limit.middleware';
 import router from './routes';
-import { acknowledgeCircleWebhook, handleCircleWebhook } from './controllers/webhook.controller';
 
 const app = express();
+
+// BigInt (u64 market ids, i128 amounts) serialises as a decimal string.
+app.set('json replacer', (_key: string, value: unknown) => (typeof value === 'bigint' ? value.toString() : value));
 
 // ─── Security ───
 app.use(helmet());
 app.use(hpp());
 app.use(cors({
+  // Explicit allowlist from CORS_ORIGINS; never "*" with credentials.
   origin: (origin, callback) => {
-    const allowedOrigins = [
-      'https://oracledesk.app',
-      'https://oracle-desk-frontend.vercel.app',
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'http://localhost:3002',
-      'http://localhost:3003',
-      'http://localhost:3004',
-      'http://localhost:3005',
-    ];
-    
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) !== -1 || config.NODE_ENV !== 'production') {
+    // Requests without an Origin header (curl, server-to-server) carry no
+    // browser credentials, so CORS doesn't apply to them.
+    if (!origin || config.CORS_ORIGINS.includes(origin)) {
       callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+      return;
     }
+    callback(null, false);
   },
   credentials: true,
 }));
 
-// Circle requires the exact raw JSON payload for webhook signature verification.
-app.head('/api/v1/webhooks/circle', acknowledgeCircleWebhook);
-app.post('/api/v1/webhooks/circle', express.raw({ type: 'application/json' }), handleCircleWebhook);
-
 // ─── Rate Limiting ───
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max:      200,
-  standardHeaders: true,
-  legacyHeaders:   false,
-  message: { ok: false, data: null, error: { code: 'RATE_LIMITED', message: 'Too many requests' } },
-}));
+app.use(globalLimiter);
 
 // ─── Body Parsing + Compression ───
 app.use(compression());
-app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '1mb' }));
 
 // ─── HTTP Logging ───
+// Paths only: morgan's "combined" format would log query strings and referrers.
 app.use(
-  morgan('combined', {
+  morgan(':method :url :status :res[content-length] - :response-time ms', {
     stream: { write: (msg) => logger.info(msg.trim()) },
     skip:   () => config.NODE_ENV === 'test',
   }),

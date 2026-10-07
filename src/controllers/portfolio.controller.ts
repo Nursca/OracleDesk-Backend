@@ -3,6 +3,8 @@ import { prisma } from '../lib/prisma';
 import { sendSuccess, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { getPortfolioSummary } from '../services/portfolio.service';
 import { getPortfolioCorrelations } from '../services/correlation.service';
+import { treasuryAvailableCapital } from '../services/chain.service';
+import { logger } from '../lib/logger';
 
 /**
  * GET /portfolio
@@ -11,12 +13,18 @@ import { getPortfolioCorrelations } from '../services/correlation.service';
  *   openPositions count, totalPnl, dailyPnl, builderFeesEarned
  */
 export async function getPortfolio(req: Request, res: Response): Promise<void> {
-  const [summary, correlations] = await Promise.all([
+  const [summary, correlations, availableCapitalRaw] = await Promise.all([
     getPortfolioSummary(),
     getPortfolioCorrelations(10_000),
+    treasuryAvailableCapital()
+      .then((v) => v.toString())
+      .catch((err) => {
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'treasury.available_capital read failed');
+        return null;
+      }),
   ]);
 
-  sendSuccess(res, { ...summary, correlationRisk: correlations });
+  sendSuccess(res, { ...summary, correlationRisk: correlations, availableCapitalRaw });
 }
 
 /**
@@ -38,7 +46,7 @@ export async function getPositions(req: Request, res: Response): Promise<void> {
       orderBy: { createdAt: 'desc' },
       include: {
         market: {
-          select: { question: true, category: true, settlementCurrency: true, expiryTimestamp: true },
+          select: { question: true, category: true, settlementCurrency: true, expiryTimestamp: true, onChainMarketId: true },
         },
         trade: {
           select: { direction: true, amount: true, edgeDetected: true, kellyFraction: true, txHash: true },
@@ -49,4 +57,28 @@ export async function getPositions(req: Request, res: Response): Promise<void> {
   ]);
 
   sendSuccess(res, positions, 200, buildPaginationMeta(page, limit, total) as any);
+}
+
+/**
+ * GET /portfolio/stats
+ * Platform counts straight from the database. (The unpushed draft of this
+ * endpoint, commit 207464d, padded them with constants; this one doesn't.)
+ */
+export async function getPlatformStats(_req: Request, res: Response): Promise<void> {
+  const [subscriberCount, copyVolume, marketCount, onChainMarketCount, traceCount] = await Promise.all([
+    prisma.user.count(),
+    prisma.copyTrade.aggregate({ _sum: { amount: true }, where: { status: 'EXECUTED' } }),
+    prisma.market.count(),
+    prisma.market.count({ where: { onChainMarketId: { not: null } } }),
+    prisma.reasoningTrace.count(),
+  ]);
+  const totalCopyVolume = copyVolume._sum.amount ?? 0;
+  sendSuccess(res, {
+    subscriberCount,
+    totalCopyVolume,
+    builderFees: 0,
+    marketCount,
+    onChainMarketCount,
+    traceCount,
+  });
 }
