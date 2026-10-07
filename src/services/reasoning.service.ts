@@ -1,7 +1,6 @@
 import { prisma } from '../lib/prisma';
 import { callLLMJSON } from '../lib/llm';   // ← Unified LLM (Claude → Gemini fallback)
 import { logger } from '../lib/logger';
-import { sha256Json } from '../utils/hash.util';
 import { Prisma } from '@prisma/client';
 import type {
   TraceInput,
@@ -26,8 +25,8 @@ const traceReasoningSchema = z.object({
  * 1. Compute edge  (agent prob − market prob)
  * 2. Compute 90% confidence interval via jackknife sampling
  * 3. Call Claude/Gemini to generate hedge conditions and reasoning narrative
- * 4. SHA-256 hash the full trace payload for on-chain commitment
- * 5. Persist to DB (IPFS CID added later by ipfs.service.ts)
+ * 4. Persist to DB. The hash is computed later, over the exact bytes pinned
+ *    to IPFS (services/trace-publish.service.ts), never over this object.
  */
 export async function generateReasoningTrace(input: TraceInput) {
   const edge = calculateEdge(input.probabilityEstimate, input.marketProbability);
@@ -51,7 +50,6 @@ export async function generateReasoningTrace(input: TraceInput) {
     timestamp:           new Date().toISOString(),
   };
 
-  const sha256Hash     = sha256Json(tracePayload);
   const previewSources = input.sourcesUsed.slice(0, 2);
 
   const trace = await prisma.reasoningTrace.create({
@@ -68,7 +66,6 @@ export async function generateReasoningTrace(input: TraceInput) {
       betSizeUsdc:         input.betSizeUsdc,
       hedgeConditions:     hedgeConditions.conditions as any,
       agentWallet:         input.agentWallet,
-      sha256Hash,
       previewSources:      previewSources as any,
       verified:            false,
       isPublic:            false,
@@ -76,7 +73,7 @@ export async function generateReasoningTrace(input: TraceInput) {
   });
 
   logger.info({ traceId: trace.id, edge, marketId: input.marketId }, 'Reasoning trace generated');
-  return { trace, sha256Hash, tracePayload };
+  return { trace, tracePayload: { ...tracePayload, traceId: trace.id } };
 }
 
 /**

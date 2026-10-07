@@ -8,7 +8,7 @@ import {
   unlockTrace,
   verifyTrace,
 } from '../controllers/trace.controller';
-import { requireAuth } from '../middlewares/auth.middleware';
+import { optionalAuth, requireAuth } from '../middlewares/auth.middleware';
 
 const router = Router();
 
@@ -17,7 +17,7 @@ router.get('/',             listTraces);
 router.get('/access/allowance', requireAuth, getMySpendingAllowance);
 router.put('/access/allowance', requireAuth, setSpendingAllowance);
 router.get('/payments', requireAuth, getMyPaymentEvents);
-router.get('/:id', getTrace);   // Returns preview if unauthenticated
+router.get('/:id', optionalAuth, getTrace);   // Preview without a token, full trace with a daily pass
 
 // Protected
 router.post('/verify',       requireAuth, verifyTrace);
