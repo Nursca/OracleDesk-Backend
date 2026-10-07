@@ -1,0 +1,126 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { Contract, StrKey, xdr } from '@stellar/stellar-sdk';
+import { setupTestEnv } from './helpers/env';
+
+setupTestEnv();
+
+// tests/fixtures/events.json: getEvents responses encoded from the contract
+// specs (synthetic; real ones had aged out of RPC retention).
+const FIXTURES = JSON.parse(readFileSync(join(__dirname, '..', '..', 'tests', 'fixtures', 'events.json'), 'utf8')).events;
+
+function toEventResponse(raw: any) {
+  return {
+    ...raw,
+    contractId: new Contract(raw.contractId),
+    topic: raw.topic.map((t: string) => xdr.ScVal.fromXDR(t, 'base64')),
+    value: xdr.ScVal.fromXDR(raw.value, 'base64'),
+  };
+}
+
+async function setup(events = FIXTURES.map(toEventResponse)) {
+  const { prisma } = await import('../src/lib/prisma');
+  const { Prisma } = await import('@prisma/client');
+  const db = {
+    events: new Map<string, any>(),
+    cursor: null as number | null,
+    markets: new Map<string, any>([
+      ['m0', { id: 'm0', onChainMarketId: 0n, question: 'Market zero?', status: 'ACTIVE' }],
+    ]),
+    traces: [{ id: 't0', traceHash: 'f4b58d4ac4068163f34bd9486f0563c70873afa5f64e915ab7e85af7dee15e4e', onChainTraceId: null as bigint | null }],
+    closedPositions: 0,
+  };
+  (prisma.chainEvent.create as any) = async ({ data }: any) => {
+    if (db.events.has(data.id)) {
+      throw new Prisma.PrismaClientKnownRequestError('dup', { code: 'P2002', clientVersion: 'test' });
+    }
+    db.events.set(data.id, data);
+    return data;
+  };
+  (prisma.indexerCursor.findUnique as any) = async () => (db.cursor === null ? null : { lastLedger: db.cursor });
+  (prisma.indexerCursor.upsert as any) = async ({ update }: any) => { db.cursor = update.lastLedger; return {}; };
+  const byChainId = (id: bigint) => [...db.markets.values()].find((m) => m.onChainMarketId === id) ?? null;
+  (prisma.market.findUnique as any) = async ({ where }: any) => byChainId(where.onChainMarketId);
+  (prisma.market.update as any) = async ({ where, data }: any) => Object.assign(db.markets.get(where.id), data);
+  (prisma.position.updateMany as any) = async () => { db.closedPositions++; return { count: 1 }; };
+  (prisma.$transaction as any) = async (ops: Promise<unknown>[]) => Promise.all(ops);
+  (prisma.reasoningTrace.findFirst as any) = async ({ where }: any) => db.traces.find((t) => t.traceHash === where.traceHash) ?? null;
+  (prisma.reasoningTrace.update as any) = async ({ where, data }: any) => Object.assign(db.traces.find((t) => t.id === where.id)!, data);
+
+  const calls: any[] = [];
+  const source = {
+    oldest: 4_951_500,
+    latest: 4_951_700,
+    async getHealth() {
+      return { status: 'healthy', oldestLedger: this.oldest, latestLedger: this.latest, ledgerRetentionWindow: 120960 } as any;
+    },
+    async getEvents(req: any) {
+      calls.push(req);
+      return { events, cursor: 'end', latestLedger: this.latest, oldestLedger: this.oldest } as any;
+    },
+  };
+  const emitted: Array<[string, any]> = [];
+  const emit = (e: string, p: any) => emitted.push([e, p]);
+  const { backfillEvents } = await import('../src/services/indexer.service');
+  return { db, source, calls, emitted, emit, backfillEvents };
+}
+
+test('indexes trades, resolutions and traces from recorded events', async () => {
+  const { db, source, calls, emitted, emit, backfillEvents } = await setup();
+  const { priceYesBps } = await import('../src/generated/fpmm');
+
+  const result = await backfillEvents(undefined, { source, emit });
+  assert.equal(calls[0].startLedger, source.oldest, 'no cursor: start at the oldest retained ledger');
+  assert.equal(result.stored, 4);
+  assert.equal(db.cursor, source.latest);
+
+  const trade = emitted.find(([e]) => e === 'TRADE_EXECUTED')![1];
+  assert.equal(trade.onChainMarketId, '0');
+  assert.equal(trade.marketId, 'm0');
+  assert.equal(trade.direction, 'YES');
+  assert.equal(trade.collateralRaw, '100000000');
+  assert.equal(trade.priceYesBps, Number(priceYesBps(1_407_129_456n, 1_599_000_000n)));
+
+  const m0 = db.markets.get('m0');
+  assert.equal(m0.status, 'RESOLVED');
+  assert.equal(m0.resolvedOutcome, true);
+  assert.equal(db.closedPositions, 1, 'only the known market closes positions');
+
+  const published = emitted.find(([e]) => e === 'REASONING_PUBLISHED')![1];
+  assert.equal(published.onChainTraceId, '0');
+  assert.equal(published.traceId, 't0');
+  assert.equal(db.traces[0].onChainTraceId, 0n);
+});
+
+test('re-reading the same ledgers is idempotent', async () => {
+  const { db, source, emitted, emit, backfillEvents } = await setup();
+  await backfillEvents(undefined, { source, emit });
+  const before = emitted.length;
+  const again = await backfillEvents(source.oldest, { source, emit });
+  assert.equal(again.seen, 4);
+  assert.equal(again.stored, 0);
+  assert.equal(emitted.length, before, 'no duplicate socket events');
+  assert.equal(db.events.size, 4);
+});
+
+test('resumes from the stored cursor, and from the oldest ledger when the cursor aged out', async () => {
+  const { db, source, calls, emit, backfillEvents } = await setup([]);
+  db.cursor = 4_951_600;
+  await backfillEvents(undefined, { source, emit });
+  assert.equal(calls[calls.length - 1].startLedger, 4_951_601);
+
+  db.cursor = 10;
+  const r = await backfillEvents(undefined, { source, emit });
+  assert.equal(r.startLedger, source.oldest);
+  assert.equal(calls[calls.length - 1].startLedger, source.oldest);
+});
+
+test('events from other contracts are ignored', async () => {
+  const foreign = { ...FIXTURES[0], id: 'x-1', contractId: StrKey.encodeContract(Buffer.alloc(32, 9)) };
+  const { source, emit, backfillEvents } = await setup([toEventResponse(foreign)]);
+  const r = await backfillEvents(undefined, { source, emit });
+  assert.equal(r.seen, 1);
+  assert.equal(r.stored, 0);
+});

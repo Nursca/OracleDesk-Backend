@@ -25,7 +25,7 @@ test('market proposal validation accepts strict binary JSON and rejects malforme
   assert.throws(() => validateMarketQuestion(JSON.stringify({
     ...valid,
     confidence_interval: { lower: 0.7, upper: 0.8 },
-  })), /Probability must be within confidence interval/);
+  })), /Probability must be within the confidence interval/);
 });
 
 test('probability, confidence interval, and edge calculations are deterministic', async () => {

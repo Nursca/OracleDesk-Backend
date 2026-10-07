@@ -1,0 +1,72 @@
+{
+  "_comment": "Synthetic getEvents responses encoded from the contract specs at contracts@eb5f3fd (values mirror market 0 and trace 0 on testnet). Real events had aged out of RPC retention when these were made; see docs/STATUS.md.",
+  "events": [
+    {
+      "type": "contract",
+      "ledgerClosedAt": "2026-09-21T13:55:00Z",
+      "transactionIndex": 1,
+      "operationIndex": 0,
+      "inSuccessfulContractCall": true,
+      "id": "0004951600-0000000001",
+      "ledger": 4951600,
+      "txHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "contractId": "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
+      "topic": [
+        "AAAADwAAAAV0cmFkZQAAAA==",
+        "AAAABQAAAAAAAAAA",
+        "AAAAEgAAAAAAAAAAmftTcQDCJCgrM94CYr2xwSswkL+DTuuQjuBbSJ8KLCs="
+      ],
+      "value": "AAAAEQAAAAEAAAAHAAAADwAAAApjb2xsYXRlcmFsAAAAAAAKAAAAAAAAAAAAAAAABfXhAAAAAA8AAAADZmVlAAAAAAoAAAAAAAAAAAAAAAAAD0JAAAAADwAAAAZpc19idXkAAAAAAAAAAAABAAAADwAAAAdvdXRjb21lAAAAABAAAAABAAAAAQAAAA8AAAADWWVzAAAAAA8AAAAKcmVzZXJ2ZV9ubwAAAAAACgAAAAAAAAAAAAAAAF9OzcAAAAAPAAAAC3Jlc2VydmVfeWVzAAAAAAoAAAAAAAAAAAAAAABT3xdwAAAADwAAAAZzaGFyZXMAAAAAAAoAAAAAAAAAAAAAAAALb7ZQ"
+    },
+    {
+      "type": "contract",
+      "ledgerClosedAt": "2026-09-21T13:55:00Z",
+      "transactionIndex": 1,
+      "operationIndex": 0,
+      "inSuccessfulContractCall": true,
+      "id": "0004951610-0000000001",
+      "ledger": 4951610,
+      "txHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "contractId": "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
+      "topic": [
+        "AAAADwAAAA9tYXJrZXRfcmVzb2x2ZWQA",
+        "AAAABQAAAAAAAAAA"
+      ],
+      "value": "AAAAEQAAAAEAAAABAAAADwAAAAdvdXRjb21lAAAAABAAAAABAAAAAQAAAA8AAAADWWVzAA=="
+    },
+    {
+      "type": "contract",
+      "ledgerClosedAt": "2026-09-21T13:55:00Z",
+      "transactionIndex": 1,
+      "operationIndex": 0,
+      "inSuccessfulContractCall": true,
+      "id": "0004951611-0000000001",
+      "ledger": 4951611,
+      "txHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "contractId": "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
+      "topic": [
+        "AAAADwAAAA9tYXJrZXRfcmVzb2x2ZWQA",
+        "AAAABQAAAAAAAAAB"
+      ],
+      "value": "AAAAEQAAAAEAAAABAAAADwAAAAdvdXRjb21lAAAAAAE="
+    },
+    {
+      "type": "contract",
+      "ledgerClosedAt": "2026-09-21T13:55:00Z",
+      "transactionIndex": 1,
+      "operationIndex": 0,
+      "inSuccessfulContractCall": true,
+      "id": "0004951620-0000000001",
+      "ledger": 4951620,
+      "txHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "contractId": "CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M",
+      "topic": [
+        "AAAADwAAAA90cmFjZV9wdWJsaXNoZWQA",
+        "AAAABQAAAAAAAAAA",
+        "AAAABQAAAAAAAAAA",
+        "AAAAEgAAAAAAAAAAmftTcQDCJCgrM94CYr2xwSswkL+DTuuQjuBbSJ8KLCs="
+      ],
+      "value": "AAAAEQAAAAEAAAAEAAAADwAAAAZhY3Rpb24AAAAAAA4AAAANY3JlYXRlX21hcmtldAAAAAAAAA8AAAAIaXBmc19jaWQAAAAOAAAAHWlwZnM6Ly9kZW1vLXRyYWNlLXBsYWNlaG9sZGVyAAAAAAAADwAAAAxwdWJsaXNoZWRfYXQAAAAFAAAAAGqxNdgAAAAPAAAACnRyYWNlX2hhc2gAAAAAAA0AAAAg9LWNSsQGgWPzS9lIbwVjxwhzr6X2TpFat+ha997hXk4="
+    }
+  ]
+}
