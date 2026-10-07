@@ -1,0 +1,20 @@
+# Repository labels. Apply with `gh label create` or a labeler action;
+# nothing in this repo applies them automatically.
+#
+# Complexity labels use Drips Wave's own levels (Trivial 100, Medium 150,
+# High 200 points, per docs.drips.network/wave/points-and-rewards). The
+# maintainer still sets complexity in the Drips dashboard; these labels just
+# make it visible on GitHub.
+
+- { name: bug, color: "d73a4a", description: "Something isn't working as documented" }
+- { name: enhancement, color: "a2eeef", description: "New feature or request" }
+- { name: good-first-issue, color: "7057ff", description: "Scoped and well-defined for a first-time contributor" }
+- { name: documentation, color: "0075ca", description: "Docs-only change" }
+- { name: security, color: "b60205", description: "Security-relevant; see SECURITY.md before discussing publicly" }
+- { name: "complexity: trivial", color: "c2e0c6", description: "Drips Wave Trivial (100 points)" }
+- { name: "complexity: medium", color: "fef2c0", description: "Drips Wave Medium (150 points)" }
+- { name: "complexity: high", color: "f9d0c4", description: "Drips Wave High (200 points)" }
+- { name: api, color: "1d76db", description: "Routes, controllers, docs/api.md" }
+- { name: stellar, color: "5319e7", description: "Chain service, indexer, payments, auth" }
+- { name: agents, color: "0e8a16", description: "LLM pipeline and agents" }
+- { name: infra, color: "d4c5f9", description: "CI, scripts, tooling" }

@@ -1,0 +1,117 @@
+# Contributing to the OracleDesk backend
+
+Thanks for helping. This is a testnet-only, unaudited project; see
+[docs/STATUS.md](docs/STATUS.md) for what works today.
+
+## Setup
+
+```bash
+git clone --recurse-submodules https://github.com/OracleDesk/OracleDesk-Backend.git
+cd OracleDesk-Backend
+nvm use                      # Node 22 (see .nvmrc)
+npm ci
+docker run -d --name oracledesk-pg -e POSTGRES_USER=oracledesk -e POSTGRES_PASSWORD=oracledesk \
+  -e POSTGRES_DB=oracledesk -p 127.0.0.1:5433:5432 postgres:16-alpine
+docker run -d --name oracledesk-redis -p 127.0.0.1:6379:6379 redis:7-alpine
+cp .env.example .env         # set DATABASE_URL=postgresql://oracledesk:oracledesk@127.0.0.1:5433/oracledesk
+npx prisma migrate dev
+npm run dev
+```
+
+Forgot `--recurse-submodules`? Run `git submodule update --init`.
+
+## Branches and commits
+
+- Branch names: `feat/…`, `fix/…`, `docs/…`, `chore/…`, `test/…`.
+- [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
+  `fix:`, `docs:`, `test:`, `chore:`, `refactor:`. One logical change per
+  commit.
+- No force-pushes to shared branches.
+
+## Checks (CI runs exactly these)
+
+```bash
+npm run check:contracts     # generated contract code matches the submodule
+npx prisma migrate deploy   # against a scratch database
+npm run build
+npm test
+```
+
+With a server running, `scripts/smoke.sh` checks health, wallet login with
+a throwaway key, market listing and a live testnet read.
+
+## Database changes
+
+Edit `prisma/schema.prisma`, then `npx prisma migrate dev --name <what>`.
+Migrations are forward-only: never edit one that has been merged. If a
+migration changes data (not just shape), say so in the PR and in a comment
+at the top of the SQL.
+
+## Chain writes
+
+Anything that signs must go through `src/services/chain.service.ts`, which
+routes agent writes through the treasury (so its on-chain caps apply) and
+does nothing but simulate unless `CHAIN_EXECUTION_MODE=live`. Never call
+`market_core.buy` with the agent key, never add a code path that signs in
+`dry-run`, and keep live mode testnet-only.
+
+## When the contracts change
+
+The contracts live in
+[OracleDesk-SmartContract](https://github.com/OracleDesk/OracleDesk-SmartContract)
+and are the source of truth. This repo pins them as the `contracts`
+submodule and copies the generated code into `src/generated/`.
+
+```bash
+git -C contracts fetch origin
+git -C contracts checkout <new commit>
+npm run sync:contracts
+npm run build && npm test   # tests/categories.test.ts fails if the Category enum changed
+git add contracts src/generated
+```
+
+Never edit `src/generated/` by hand. If an event or entrypoint changed,
+update `src/services/indexer.service.ts` / `chain.service.ts` and
+`tests/fixtures/events.json`. If you think a contract needs
+to change, write it up in [docs/contract-requests.md](docs/contract-requests.md)
+and open the issue in the contracts repo.
+
+## Working on a Drips Wave issue
+
+This repo takes part in [Drips Wave](https://docs.drips.network/wave/).
+Per the current Drips docs:
+
+1. Find the issue on the Drips Wave **Explore** page (or in this repo's
+   issues once a maintainer has added it to a Wave).
+2. **Apply** for it on Drips. Don't start coding until a maintainer assigns
+   you; the issue isn't yours before that.
+3. Open a PR that links the issue (`Closes #123`).
+4. Points are earned when the PR is merged and the issue is marked resolved
+   **before the Wave ends**. Complexity (Trivial 100 / Medium 150 /
+   High 200 points) is set by the maintainer; if an issue turns out harder
+   than labelled, say so on the issue before it's resolved.
+
+Drips also limits how many issues one person can be assigned per
+organization in a Wave; check the Drips docs for the current numbers.
+Issue drafts live in [docs/wave-issues/](docs/wave-issues/) before they're
+filed.
+
+## What a good PR includes
+
+- A short description and the issue it closes.
+- All checks above passing locally.
+- Tests for new behaviour. Anything touching auth, payments or chain writes
+  needs a test for the failure cases, not only the happy path (see
+  `tests/auth.test.ts` and `tests/payment.test.ts`).
+- `docs/api.md` updated in the same PR when a request or response changes
+  (it is the contract with the frontend; the frontend keeps a copy).
+- On-chain amounts as `bigint` / decimal strings ending in `Raw`, never
+  floats.
+
+## Never commit secrets
+
+No `.env` file, no Stellar secret seeds (`S…`), no API keys or JWT secrets,
+in code, tests, fixtures or logs. Tests generate throwaway keys with
+`Keypair.random()`. New config goes in `.env.example` with an empty value. If you commit a secret by accident, tell a
+maintainer privately (see [SECURITY.md](SECURITY.md)) so it can be rotated;
+removing it in a later commit is not enough.

@@ -47,3 +47,18 @@ the commitment hash has to rebuild the XDR by hand. A no-op view function
 that takes a `ResolutionSpec`, or a `spec_hash(spec) -> BytesN<32>` view,
 would put the type in the spec and let clients ask the contract for the
 hash instead of re-implementing it.
+
+## 5. Make `agents/stellar/adapter.ts` usable as a library
+
+The backend would rather depend on the agents package for signing than
+duplicate it, but today the adapter:
+
+- returns `{ dryRun: true, args }` in dry-run without building or
+  simulating the transaction, so a dry run can't catch a contract error;
+- imports bindings by npm package name (`@oracledesk/bindings-*`), which
+  only resolve inside the contracts repo;
+- has no `agentSell`.
+
+If dry-run simulated (and returned the simulated result), the bindings were
+injectable, and `agentSell` existed, `src/services/chain.service.ts` here
+could become a thin wrapper around it. Its method names already match.

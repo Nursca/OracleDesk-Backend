@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    name: Contracts sync, migrate, build, test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: oracledesk
+          POSTGRES_PASSWORD: oracledesk
+          POSTGRES_DB: oracledesk
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U oracledesk"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      # Throwaway CI service credentials, not secrets.
+      DATABASE_URL: postgresql://oracledesk:oracledesk@localhost:5432/oracledesk
+      REDIS_URL: redis://localhost:6379
+      NODE_ENV: test
+      CHAIN_EXECUTION_MODE: dry-run
+      INDEXER_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generated contract code matches the submodule
+        run: npm run check:contracts
+
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      - run: npm run build
+      - run: npm test
