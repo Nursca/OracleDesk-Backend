@@ -1,105 +1,44 @@
+/**
+ * Resolution status. Outcomes are decided on-chain by the resolver contract
+ * (Reflector price specs or signer attestations); the backend only reads.
+ */
 import { prisma } from '../lib/prisma';
 import { AppError } from '../middlewares/error.middleware';
-import { submitOracleApproval } from './chain.service';
+import { getOnChainMarket, resolverState } from './chain.service';
+import type { MarketStatus } from '../generated/market-core';
 
-export async function approveMarketResolution(params: {
-  marketId: string;
-  yesWon: boolean;
-  rationale?: string;
-}): Promise<{ market: any; txHash: string }> {
-  const market = await prisma.market.findUnique({ where: { id: params.marketId } });
-  if (!market) throw new AppError(404, 'MARKET_NOT_FOUND', 'Market not found');
-  if (!market.onChainAddress) {
-    throw new AppError(409, 'MARKET_NOT_DEPLOYED', 'Market has no on-chain address yet');
-  }
-  if (!['ACTIVE', 'RESOLVING'].includes(market.status)) {
-    throw new AppError(409, 'MARKET_NOT_RESOLVABLE', `Market status ${market.status} cannot be resolved`);
-  }
+export type MarketStatusView =
+  | { tag: 'Open' }
+  | { tag: 'Resolved'; outcome: 'Yes' | 'No' }
+  | { tag: 'Void' };
 
-  const txHash = await submitOracleApproval({
-    marketAddress: market.onChainAddress,
-    yesWon: params.yesWon,
-  });
-
-  const updated = await prisma.market.update({
-    where: { id: market.id },
-    data: { status: 'RESOLVING' },
-  });
-
-  await prisma.agentLog.create({
-    data: {
-      agentType: 'MARKET_MAKER',
-      level: 'INFO',
-      action: 'ORACLE_RESOLUTION_APPROVED',
-      marketId: market.id,
-      data: {
-        yesWon: params.yesWon,
-        txHash,
-        marketAddress: market.onChainAddress,
-        rationale: params.rationale,
-      } as any,
-    },
-  });
-
-  return { market: updated, txHash };
+export function marketStatusView(status: MarketStatus): MarketStatusView {
+  if (status.tag === 'Resolved') return { tag: 'Resolved', outcome: status.values[0].tag };
+  return { tag: status.tag };
 }
 
-export async function finalizeMarketResolution(params: {
-  marketAddress: string;
-  yesWon: boolean;
-  txHash?: string;
-}): Promise<any> {
-  const market = await prisma.market.findFirst({
-    where: { onChainAddress: { equals: params.marketAddress, mode: 'insensitive' } },
-  });
-  if (!market) throw new AppError(404, 'MARKET_NOT_FOUND', 'No market found for on-chain address');
-
-  const updated = await prisma.market.update({
-    where: { id: market.id },
-    data: {
-      status: 'RESOLVED',
-      resolvedOutcome: params.yesWon,
-      resolvedAt: new Date(),
-    },
-  });
-
-  await prisma.position.updateMany({
-    where: { marketId: market.id, status: 'OPEN' },
-    data: { status: 'CLOSED', closedAt: new Date(), closeReason: params.yesWon ? 'YES_RESOLVED' : 'NO_RESOLVED' },
-  });
-
-  await prisma.agentLog.create({
-    data: {
-      agentType: 'MARKET_MAKER',
-      level: 'INFO',
-      action: 'MARKET_RESOLVED',
-      marketId: market.id,
-      data: { yesWon: params.yesWon, txHash: params.txHash, marketAddress: params.marketAddress } as any,
-    },
-  });
-
-  return updated;
-}
-
-export async function getResolutionStatus(marketId: string): Promise<any> {
+export async function getResolutionStatus(marketId: string) {
   const market = await prisma.market.findUnique({
     where: { id: marketId },
-    select: {
-      id: true,
-      question: true,
-      status: true,
-      onChainAddress: true,
-      resolutionOracle: true,
-      resolvedOutcome: true,
-      resolvedAt: true,
-      agentLogs: {
-        where: { action: { in: ['ORACLE_RESOLUTION_APPROVED', 'MARKET_RESOLVED'] } },
-        orderBy: { createdAt: 'desc' },
-        take: 10,
-      },
-    },
+    select: { id: true, status: true, onChainMarketId: true, resolutionHash: true, resolutionSpec: true },
   });
-
   if (!market) throw new AppError(404, 'MARKET_NOT_FOUND', 'Market not found');
-  return market;
+  if (market.onChainMarketId === null) {
+    throw new AppError(409, 'MARKET_NOT_ON_CHAIN', 'Market has not been created on-chain yet');
+  }
+
+  const [state, onChain] = await Promise.all([
+    resolverState(market.onChainMarketId),
+    getOnChainMarket(market.onChainMarketId),
+  ]);
+
+  return {
+    marketId: market.id,
+    onChainMarketId: market.onChainMarketId.toString(),
+    resolverState: state.tag,
+    marketStatus: marketStatusView(onChain.status),
+    resolutionHash: market.resolutionHash,
+    resolutionSpec: market.resolutionSpec,
+    dbStatus: market.status,
+  };
 }

@@ -1,10 +1,10 @@
 import { Router } from 'express';
-import { approveResolution, getResolution } from '../controllers/oracle.controller';
-import { requireAuth } from '../middlewares/auth.middleware';
+import { getResolution } from '../controllers/oracle.controller';
 
 const router = Router();
 
+// Read-only. POST /oracle/resolve was removed: outcomes are decided on-chain
+// by the resolver contract, never by this API.
 router.get('/markets/:marketId/resolution', getResolution);
-router.post('/resolve', requireAuth, approveResolution);
 
 export default router;
