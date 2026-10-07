@@ -1,13 +1,17 @@
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { config } from '../config';
+import { CONTRACTS, PAYMENTS_RECIPIENT } from '../config/contracts';
+import { formatUsdc, toDisplayUsdc } from '../lib/amounts';
+import { verifyUsdcTransfer } from './payment-verification.service';
 import { AppError } from '../middlewares/error.middleware';
 import type { SubscriptionAccess } from '../types';
 import dayjs from 'dayjs';
-import { findCircleTransactionByHash } from './circle.service';
 
-const PER_TRACE_PRICE_USDC = 0.005;  // $0.005 per trace
-const DAILY_PASS_PRICE_USDC = 0.50;  // $0.50 daily pass
+/** Daily pass price in 7-decimal USDC base units (DAILY_PASS_PRICE_RAW). */
+export const DAILY_PASS_PRICE_RAW = BigInt(config.DAILY_PASS_PRICE_RAW);
+/** Per-trace unlocks are sold by the x402 service, not this backend (docs/api.md). */
+const PER_TRACE_PRICE_RAW = 50_000n; // 0.005 USDC, shown in previews only
 
 /**
  * Checks whether a user has access to a specific reasoning trace.
@@ -54,50 +58,50 @@ export async function checkAccess(
 }
 
 /**
- * Records a nanopayment and grants access.
+ * Records a daily-pass payment and grants access.
  *
- * Flow:
- * 1. Verify the payment transaction on-chain (or simulate for testnet)
- * 2. Create a Subscription record with correct expiry
- * 3. Return the subscription details
- *
- * Daily pass expires 24 hours from purchase.
- * Per-trace access is permanent.
+ * The transaction must be a successful USDC `transfer` from the user's own
+ * wallet to PAYMENTS_RECIPIENT for at least the price, verified on-chain
+ * (payment-verification.service.ts). Each transaction hash is used once.
+ * Per-trace unlocks go through the x402 service instead.
  */
 export async function recordPayment(params: {
-  userId:   string;
-  traceId?: string;
-  type:     'PER_TRACE' | 'DAILY_PASS';
-  txHash:   string;
-  amount:   number;
+  userId:        string;
+  walletAddress: string;
+  traceId?:      string;
+  type:          'PER_TRACE' | 'DAILY_PASS';
+  txHash:        string;
 }): Promise<any> {
-  const { userId, traceId, type, txHash, amount } = params;
+  const { userId, walletAddress, traceId, type } = params;
+  const txHash = params.txHash.toLowerCase();
 
-  // Validate payment amount
-  const expectedAmount = type === 'DAILY_PASS' ? DAILY_PASS_PRICE_USDC : PER_TRACE_PRICE_USDC;
-  if (amount < expectedAmount) {
-    throw new AppError(400, 'INSUFFICIENT_PAYMENT', 
-      `Expected ${expectedAmount} USDC but received ${amount}`);
+  if (type !== 'DAILY_PASS') {
+    throw new AppError(400, 'USE_X402', 'Per-trace unlocks are paid through the x402 trace service, not this endpoint');
   }
 
-  // Idempotency: check if txHash already processed
-  const existing = await prisma.subscription.findFirst({ where: { txHash } });
+  // Idempotency: a hash is consumed once. Re-submitting your own hash returns
+  // the subscription it already bought; anyone else's hash is rejected.
+  const existing = await prisma.paymentEvent.findUnique({ where: { txHash } });
   if (existing) {
-    logger.warn({ txHash }, 'Duplicate subscription payment — returning existing');
-    return existing;
+    if (existing.userId === userId) {
+      const sub = await prisma.subscription.findFirst({ where: { txHash } });
+      if (sub) return sub;
+    }
+    throw new AppError(409, 'PAYMENT_ALREADY_USED', 'This payment has already been used');
   }
 
-  // Verify on-chain payment (simplified for testnet)
-  const paymentVerified = await verifyPaymentTransaction(txHash, amount);
-  if (!paymentVerified) {
-    throw new AppError(402, 'PAYMENT_UNVERIFIED', 'Could not verify payment on-chain');
-  }
+  const transfer = await verifyUsdcTransfer({
+    txHash,
+    token:     CONTRACTS.usdc,
+    from:      walletAddress,
+    to:        PAYMENTS_RECIPIENT,
+    minAmount: DAILY_PASS_PRICE_RAW,
+  });
+  const amount = toDisplayUsdc(transfer.amount);
 
   await enforceSpendingAllowance(userId, amount, type);
 
-  const expiresAt = type === 'DAILY_PASS'
-    ? dayjs().add(24, 'hour').toDate()
-    : null;
+  const expiresAt = dayjs().add(24, 'hour').toDate();
 
   const subscription = await prisma.$transaction(async (tx) => {
     const created = await tx.subscription.create({
@@ -113,23 +117,20 @@ export async function recordPayment(params: {
       },
     });
 
-    await tx.paymentEvent.upsert({
-      where: { txHash },
-      create: {
+    // Unique on txHash: a concurrent request with the same hash fails here.
+    await tx.paymentEvent.create({
+      data: {
         userId,
-        traceId: traceId ?? null,
+        traceId:     traceId ?? null,
         txHash,
         type,
         amount,
-        currency: 'USDC',
-        status: 'CONFIRMED',
+        amountRaw:   transfer.amount.toString(),
+        fromAddress: transfer.from,
+        currency:    'USDC',
+        status:      'CONFIRMED',
         confirmedAt: new Date(),
-        metadata: { subscriptionId: created.id } as any,
-      },
-      update: {
-        status: 'CONFIRMED',
-        confirmedAt: new Date(),
-        metadata: { subscriptionId: created.id } as any,
+        metadata:    { subscriptionId: created.id, ledger: transfer.ledger } as any,
       },
     });
 
@@ -141,7 +142,7 @@ export async function recordPayment(params: {
     return created;
   });
 
-  logger.info({ subscriptionId: subscription.id, type, userId }, 'Subscription created');
+  logger.info({ subscriptionId: subscription.id, type, userId, amountRaw: transfer.amount.toString() }, 'Subscription created');
   return subscription;
 }
 
@@ -157,7 +158,7 @@ export async function getTracWithAccessControl(
 ): Promise<any> {
   const trace = await prisma.reasoningTrace.findUnique({
     where: { id: traceId },
-    include: { market: { select: { question: true, category: true } } },
+    include: { market: { select: { question: true, category: true, settlementCurrency: true, onChainMarketId: true } } },
   });
 
   if (!trace) throw new AppError(404, 'TRACE_NOT_FOUND', 'Reasoning trace not found');
@@ -187,11 +188,14 @@ export async function getTracWithAccessControl(
     sourcesUsed:         trace.previewSources,  // Preview: only first 2 sources
     verified:            trace.verified,
     ipfsCid:             trace.ipfsCid,
+    traceHash:           trace.traceHash,
+    onChainTraceId:      trace.onChainTraceId,
     createdAt:           trace.createdAt,
     accessLevel:         'FREE_PREVIEW',
     lockedFields:        ['fullSources', 'hedgeConditions', 'betFraction', 'betSizeUsdc'],
-    unlockPrice:         PER_TRACE_PRICE_USDC,
-    dailyPassPrice:      DAILY_PASS_PRICE_USDC,
+    unlockPriceRaw:      PER_TRACE_PRICE_RAW.toString(),
+    dailyPassPriceRaw:   DAILY_PASS_PRICE_RAW.toString(),
+    dailyPassPrice:      formatUsdc(DAILY_PASS_PRICE_RAW),
   };
 }
 
@@ -277,29 +281,4 @@ export async function listPaymentEvents(userId: string): Promise<any[]> {
     orderBy: { createdAt: 'desc' },
     take: 100,
   });
-}
-
-/**
- * Verifies that a USDC payment transaction occurred on-chain.
- * For testnet: always returns true (Circle testnet transactions).
- * For production: would verify USDC Transfer event on Arc.
- */
-async function verifyPaymentTransaction(
-  txHash: string,
-  expectedAmount: number,
-): Promise<boolean> {
-  const transaction = await findCircleTransactionByHash(txHash);
-  if (!transaction) {
-    if (config.NODE_ENV !== 'production' && !config.CIRCLE_STRICT_PAYMENT_VERIFICATION) {
-      logger.debug({ txHash }, 'Development mode: Circle transaction not found; accepting payment for local testing');
-      return true;
-    }
-    return false;
-  }
-
-  const state = String(transaction.state ?? transaction.status ?? '').toUpperCase();
-  const successful = ['COMPLETE', 'CONFIRMED', 'FINALIZED', 'SUCCESS', 'COMPLETED'].includes(state);
-  const paidAmount = Number(transaction.amounts?.[0] ?? transaction.amount ?? transaction.amountInUSD ?? 0);
-
-  return successful && paidAmount + 1e-9 >= expectedAmount;
 }

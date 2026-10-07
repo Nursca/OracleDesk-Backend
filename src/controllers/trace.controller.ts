@@ -1,7 +1,8 @@
 import type { Request, Response } from 'express';
+import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
-import { verifyCID } from '../services/ipfs.service';
+import { verifyTraceOnChain } from '../services/trace-publish.service';
 import {
   getTracWithAccessControl,
   getSpendingAllowance,
@@ -10,6 +11,13 @@ import {
   upsertSpendingAllowance,
 } from '../services/subscription.service';
 
+const unlockSchema = z.object({
+  txHash:    z.string().regex(/^[0-9a-fA-F]{64}$/, 'must be a 64-character hex transaction hash'),
+  type:      z.enum(['PER_TRACE', 'DAILY_PASS']),
+  amountRaw: z.string().regex(/^\d+$/).optional(),
+  amount:    z.number().positive().optional(),
+});
+
 /**
  * GET /traces
  * Returns paginated list of reasoning traces.
@@ -17,10 +25,16 @@ import {
  */
 export async function listTraces(req: Request, res: Response): Promise<void> {
   const { page, limit, skip } = parsePagination(req.query as any);
-  const agentType = req.query.agentType as string | undefined;
+  const agentType = req.query.agentType;
+  const marketId = req.query.marketId;
+  if (agentType !== undefined && agentType !== 'MARKET_MAKER' && agentType !== 'TRADER') {
+    sendError(res, 400, 'VALIDATION_ERROR', 'agentType must be MARKET_MAKER or TRADER');
+    return;
+  }
 
   const where = {
-    ...(agentType ? { agentType: agentType as any } : {}),
+    ...(agentType ? { agentType: agentType as 'MARKET_MAKER' | 'TRADER' } : {}),
+    ...(typeof marketId === 'string' && marketId ? { marketId } : {}),
   };
 
   const [traces, total] = await Promise.all([
@@ -40,9 +54,12 @@ export async function listTraces(req: Request, res: Response): Promise<void> {
         confidenceInterval:  true,
         verified:            true,
         ipfsCid:             true,
+        traceHash:           true,
+        onChainTraceId:      true,
+        publishTxHash:       true,
         previewSources:      true,
         createdAt:           true,
-        market: { select: { question: true, category: true, settlementCurrency: true } },
+        market: { select: { question: true, category: true, settlementCurrency: true, onChainMarketId: true } },
       },
     }),
     prisma.reasoningTrace.count({ where }),
@@ -67,10 +84,10 @@ export async function getTrace(req: Request, res: Response): Promise<void> {
 
 /**
  * POST /traces/verify
- * Verifies a trace's integrity by comparing IPFS content hash to stored hash.
+ * Fetches the content at the on-chain CID and compares sha256 of the exact
+ * bytes with reasoning_registry.get_trace(...).trace_hash.
  *
  * Request body: { traceId: string }
- * Returns: { verified: boolean, storedHash, computedHash, ipfsCid }
  */
 export async function verifyTrace(req: Request, res: Response): Promise<void> {
   const { traceId } = req.body as { traceId?: string };
@@ -80,16 +97,16 @@ export async function verifyTrace(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const verification = await verifyCID(traceId);
+  const verification = await verifyTraceOnChain(traceId);
   sendSuccess(res, verification);
 }
 
 /**
  * POST /traces/:id/unlock
- * Pay to unlock a trace's full content via USDC nanopayment.
+ * Daily pass: verifies an on-chain USDC transfer and grants 24h access.
  *
- * Request body: { txHash, amount, type: 'PER_TRACE' | 'DAILY_PASS' }
- * Requires auth.
+ * Request body: { txHash, type: 'DAILY_PASS', amountRaw? }
+ * The amount is taken from the verified transaction, not from the body.
  */
 export async function unlockTrace(req: Request, res: Response): Promise<void> {
   if (!req.user) {
@@ -97,36 +114,23 @@ export async function unlockTrace(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const traceId = String(req.params.id);
-  const { txHash, amount, type } = req.body as {
-    txHash: string;
-    amount: number;
-    type: 'PER_TRACE' | 'DAILY_PASS';
-  };
-
-  if (!txHash || !amount || !type) {
-    sendError(res, 400, 'MISSING_FIELDS', 'txHash, amount, and type are required');
+  const parsed = unlockSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'txHash and type are required',
+      parsed.error.flatten().fieldErrors as any);
     return;
   }
 
-  // Ensure the user record exists — a valid JWT may pre-date DB seeding
-  // or come from a Postman test before /auth/connect was called.
-  await prisma.user.upsert({
-    where:  { walletAddress: req.user.walletAddress },
-    create: { id: req.user.userId, walletAddress: req.user.walletAddress },
-    update: {},
-  });
-
+  const traceId = String(req.params.id);
   const subscription = await recordPayment({
-    userId:  req.user.userId,
-    traceId: type === 'PER_TRACE' ? traceId : undefined,
-    type,
-    txHash,
-    amount,
+    userId:        req.user.userId,
+    walletAddress: req.user.walletAddress,
+    traceId:       undefined,
+    type:          parsed.data.type,
+    txHash:        parsed.data.txHash,
   });
 
-  // Return the full trace now that it's unlocked
-  const trace = await getTracWithAccessControl(traceId, req.user.userId);
+  const trace = await getTracWithAccessControl(traceId, req.user.userId).catch(() => null);
   sendSuccess(res, { subscription, trace }, 201);
 }
 
