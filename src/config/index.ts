@@ -1,63 +1,166 @@
+import crypto from 'crypto';
 import dotenv from 'dotenv';
+import { Keypair, Networks, StrKey } from '@stellar/stellar-sdk';
 import { z } from 'zod';
 
 dotenv.config();
 
-const envSchema = z.object({
-  DATABASE_URL:               z.string().min(1, 'DATABASE_URL is required'),
-  PORT:                       z.string().default('8000').transform(Number),
-  NODE_ENV:                   z.enum(['development', 'production', 'test']).default('development'),
+const optionalString = z.string().default('');
 
-  // ── LLM providers ──────────────────────────────────────────────────────────
-  // ANTHROPIC_API_KEY is optional but strongly recommended:
-  //   - Routes market generation through Claude (generous quota, no RPM issues)
-  //   - Gemini remains available as automatic fallback
-  //   - Without this key, all LLM calls go to Gemini (subject to free-tier limits)
-  ANTHROPIC_API_KEY:          z.string().default(''),
+const stellarAccount = z
+  .string()
+  .refine((v) => StrKey.isValidEd25519PublicKey(v), 'must be a G… Stellar public key');
 
-  GEMINI_API_KEY:             z.string().min(1, 'GEMINI_API_KEY is required'),
+const optionalContract = z
+  .string()
+  .default('')
+  .refine((v) => v === '' || StrKey.isValidContract(v), 'must be a C… Stellar contract id');
 
-  POLYGON_PRIVATE_KEY:       z.string().default(''), // required for Polymarket execution, but not for other features
+const optionalAddress = z
+  .string()
+  .default('')
+  .refine(
+    (v) => v === '' || StrKey.isValidEd25519PublicKey(v) || StrKey.isValidContract(v),
+    'must be a G… account or C… contract address',
+  );
 
-  PINATA_API_KEY:             z.string().min(1, 'PINATA_API_KEY is required'),
-  PINATA_SECRET_API_KEY:      z.string().min(1, 'PINATA_SECRET_API_KEY is required'),
+const commaList = (item: z.ZodType<string, string>, fallback = "") =>
+  z
+    .string()
+    .default(fallback)
+    .transform((v) => v.split(',').map((s) => s.trim()).filter(Boolean))
+    .pipe(z.array(item));
 
-  ARC_RPC_URL:                z.string().min(1).default('https://rpc.arc.fun'),
-  ARC_CHAIN_ID:               z.string().default('1338').transform(Number),
+const envSchema = z
+  .object({
+    DATABASE_URL: z.string({ error: 'is required' }).min(1, 'is required'),
+    PORT: z.string().default('8000').transform(Number),
+    NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+    REDIS_URL: z.string().default('redis://localhost:6379'),
 
-  CIRCLE_API_KEY:             z.string().default(''),
-  CIRCLE_ENTITY_SECRET:       z.string().default(''),
-  CIRCLE_BASE_URL:            z.string().url().default('https://api.circle.com'),
-  CIRCLE_WALLET_ID:           z.string().default(''),
-  CIRCLE_WALLET_ADDRESS:      z.string().default(''),
-  CIRCLE_BLOCKCHAIN:          z.string().default('ARC-TESTNET'),
-  CIRCLE_STRICT_PAYMENT_VERIFICATION: z.string().default('false').transform(v => v === 'true'),
+    // ── HTTP ──────────────────────────────────────────────────────────────
+    // Comma-separated origins allowed to call the API with credentials.
+    CORS_ORIGINS: commaList(z.string().url(), 'http://localhost:3000'),
 
-  USDC_TOKEN_ADDRESS:         z.string().default('0x3600000000000000000000000000000000000000'),
-  EURC_TOKEN_ADDRESS:         z.string().default('0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a'),
-  TREASURY_MANAGER_ADDRESS:   z.string().default('0xb326E280D2e115B6BEC25154142970a90074e7F8'),
-  POSITION_LEDGER_ADDRESS:    z.string().default('0x4ac9c8A1F68c6d8979343746825Df09DD1907b44'),
-  MULTISIG_ORACLE_ADDRESS:    z.string().default('0xD21251d0f66245C1B259d720F3795633a803b8B9'),
-  MARKET_FACTORY_ADDRESS:     z.string().default('0xF5b7E790168aF77418Ab9eC37Cb7Eb7851e4a36a'),
-  REASONING_REGISTRY_ADDRESS: z.string().default('0xE3188B3b4E14d74E6110137FF91f12B981A82257'),
+    // ── Auth ──────────────────────────────────────────────────────────────
+    // Signs JWTs. Required in production; an ephemeral one is generated in
+    // development/test so a fresh .env boots (sessions then end on restart).
+    JWT_SECRET: optionalString,
+    // Server key that signs SEP-10 challenge transactions. Not a funded
+    // account and never the agent key. Same ephemeral fallback as above.
+    AUTH_SIGNING_SECRET: optionalString,
+    AUTH_HOME_DOMAIN: z.string().default('localhost'),
+    AUTH_WEB_AUTH_DOMAIN: optionalString,
+    // G… addresses allowed to call admin endpoints.
+    ADMIN_ADDRESSES: commaList(stellarAccount),
 
-  POLYMARKET_BUILDER_CODE:    z.string().default('0x0000000000000000000000000000000000000000'),
-  JWT_SECRET:                 z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
-  AGENT_PRIVATE_KEY:          z.string().default(''),
-  AGENT_WALLET_ADDRESS:       z.string().default(''),
-  CHAIN_EXECUTION_MODE:       z.enum(['mock', 'wallet', 'circle']).default('mock'),
+    // ── Stellar ───────────────────────────────────────────────────────────
+    STELLAR_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
+    STELLAR_NETWORK_PASSPHRASE: z.string().default(Networks.TESTNET),
+    MARKET_CORE_CONTRACT_ID: optionalContract,
+    TREASURY_CONTRACT_ID: optionalContract,
+    RESOLVER_CONTRACT_ID: optionalContract,
+    REASONING_REGISTRY_CONTRACT_ID: optionalContract,
+    USDC_CONTRACT_ID: optionalContract,
+    // Where premium payments must be sent. Defaults to the treasury contract
+    // (see docs/api.md: that makes subscription revenue trading capital).
+    PAYMENTS_RECIPIENT: optionalAddress,
+    DAILY_PASS_PRICE_RAW: z.string().regex(/^\d+$/, 'must be an integer in 7-decimal base units').default('5000000'),
 
-  NEWSAPI_KEY:                z.string().default(''),
-  FRED_API_KEY:               z.string().default(''),
-});
+    // dry-run: every write is built and simulated, never signed or sent.
+    // live: writes are signed with AGENT_SECRET_KEY and submitted (testnet only).
+    CHAIN_EXECUTION_MODE: z.enum(['dry-run', 'live']).default('dry-run'),
+    AGENT_SECRET_KEY: optionalString,
 
-const parsed = envSchema.safeParse(process.env);
+    // Resolution spec committed at market creation (ADR 0001). Signer mode:
+    // RESOLUTION_SIGNERS attest the outcome on the resolver contract. Empty
+    // means the agent account is the only signer.
+    RESOLUTION_SIGNERS: commaList(stellarAccount),
+    RESOLUTION_THRESHOLD: z.string().default('1').transform(Number),
+    RESOLUTION_DISPUTE_WINDOW_SECS: z.string().default('86400').transform(Number),
 
-if (!parsed.success) {
-  console.error('❌ Invalid environment variables:');
-  console.error(parsed.error.flatten().fieldErrors);
-  process.exit(1);
+    INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    INDEXER_POLL_MS: z.string().default('5000').transform(Number),
+
+    // ── LLM providers (optional; generation fails at runtime without one) ─
+    ANTHROPIC_API_KEY: optionalString,
+    GEMINI_API_KEY: optionalString,
+
+    // ── IPFS ──────────────────────────────────────────────────────────────
+    PINATA_API_KEY: optionalString,
+    PINATA_SECRET_API_KEY: optionalString,
+    IPFS_GATEWAY_URL: z.string().url().default('https://gateway.pinata.cloud/ipfs'),
+
+    // ── Data sources ──────────────────────────────────────────────────────
+    NEWSAPI_KEY: optionalString,
+    FRED_API_KEY: optionalString,
+  })
+  .superRefine((env, ctx) => {
+    if (env.JWT_SECRET && env.JWT_SECRET.length < 32) {
+      ctx.addIssue({ code: 'custom', path: ['JWT_SECRET'], message: 'must be at least 32 characters' });
+    }
+    if (env.NODE_ENV === 'production') {
+      for (const key of ['JWT_SECRET', 'AUTH_SIGNING_SECRET'] as const) {
+        if (!env[key]) ctx.addIssue({ code: 'custom', path: [key], message: 'is required in production' });
+      }
+    }
+    for (const key of ['AUTH_SIGNING_SECRET', 'AGENT_SECRET_KEY'] as const) {
+      if (env[key] && !StrKey.isValidEd25519SecretSeed(env[key])) {
+        ctx.addIssue({ code: 'custom', path: [key], message: 'must be a Stellar secret seed (S…)' });
+      }
+    }
+    if (env.CHAIN_EXECUTION_MODE === 'live') {
+      if (!env.AGENT_SECRET_KEY) {
+        ctx.addIssue({ code: 'custom', path: ['AGENT_SECRET_KEY'], message: 'is required when CHAIN_EXECUTION_MODE=live' });
+      }
+      if (env.STELLAR_NETWORK_PASSPHRASE !== Networks.TESTNET) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['STELLAR_NETWORK_PASSPHRASE'],
+          message: 'live mode is testnet-only; use the testnet passphrase',
+        });
+      }
+    }
+  });
+
+export type Config = z.infer<typeof envSchema> & {
+  /** Secrets generated for this process because they were not configured. */
+  ephemeralSecrets: string[];
+};
+
+export class ConfigError extends Error {}
+
+/** Parses an env object. Throws ConfigError naming every bad variable. */
+export function loadConfig(env: NodeJS.ProcessEnv): Config {
+  const parsed = envSchema.safeParse(env);
+  if (!parsed.success) {
+    const lines = parsed.error.issues.map((i) => `  ${i.path.join('.') || '(root)'} ${i.message}`);
+    throw new ConfigError(`Invalid environment configuration:\n${lines.join('\n')}`);
+  }
+  const data = parsed.data;
+  const ephemeralSecrets: string[] = [];
+  if (!data.JWT_SECRET) {
+    data.JWT_SECRET = crypto.randomBytes(32).toString('hex');
+    ephemeralSecrets.push('JWT_SECRET');
+  }
+  if (!data.AUTH_SIGNING_SECRET) {
+    data.AUTH_SIGNING_SECRET = Keypair.random().secret();
+    ephemeralSecrets.push('AUTH_SIGNING_SECRET');
+  }
+  if (!data.AUTH_WEB_AUTH_DOMAIN) data.AUTH_WEB_AUTH_DOMAIN = data.AUTH_HOME_DOMAIN;
+  return { ...data, ephemeralSecrets };
 }
 
-export const config = parsed.data;
-export type Config = typeof config;
+function loadOrExit(): Config {
+  try {
+    return loadConfig(process.env);
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
+}
+
+export const config = loadOrExit();
