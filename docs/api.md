@@ -1,0 +1,536 @@
+# OracleDesk backend API (Stellar)
+
+This is the contract between `OracleDesk-Frontend` and this backend. The
+Soroban contracts in `OracleDesk-SmartContract/oracledesk-stellar` are the
+source of truth for anything on-chain; this API never overrides them.
+
+Base URL: `/api/v1` (health is at `/health`).
+
+## Conventions
+
+### Envelope
+
+Every response, success or error:
+
+```json
+{ "ok": true,  "data": { }, "error": null, "meta": { } }
+{ "ok": false, "data": null, "error": { "code": "SOME_CODE", "message": "Readable text", "details": { } } }
+```
+
+`meta` is optional. List endpoints put pagination there:
+`{ "page": 1, "limit": 20, "total": 57, "totalPages": 3 }`.
+
+### Auth
+
+Protected routes take `Authorization: Bearer <jwt>`. The JWT comes from
+`POST /auth/verify` and lasts 7 days. Errors: `401 UNAUTHORIZED`,
+`401 INVALID_TOKEN`, `401 TOKEN_EXPIRED` (the frontend clears its session on
+the last one).
+
+Routes marked **optional auth** work without a token and return more when
+one is present.
+
+### Identifiers and amounts
+
+| Kind | JSON type | Example | Notes |
+|---|---|---|---|
+| Backend ids (`id`, `marketId`, `traceId`) | string (UUID) | `"8c1f…"` | Database ids. |
+| `onChainMarketId` | decimal string or `null` | `"0"` | market-core `u64` id, 0-based and sequential (`0 … market_count()-1`). Never a JS number. `null` until the creation tx is confirmed. |
+| `onChainTraceId` | decimal string or `null` | `"3"` | reasoning-registry `u64` trace id. |
+| On-chain amounts | decimal string, name ends in `Raw` | `"10000000"` | i128 in USDC base units, **7 decimals** (1 USDC = `10000000`). |
+| Display amounts | number | `12.5` | Floats for display only. Never build a transaction from them. |
+| Probabilities | number 0–1 | `0.62` | Display. On-chain prices are basis points (`yesBps`, 0–10000). |
+| Stellar addresses | string | `"GABC…"` / `"CABC…"` | `G…` accounts, `C…` contracts. Case-sensitive (StrKey is uppercase). |
+| Hashes | lowercase hex, no `0x` | `"9f86…"` | sha256, 64 chars. Stellar tx hashes are also 64 hex chars. |
+
+### Categories
+
+The backend keeps its finer categories for display and filtering. Markets go
+on-chain with the contract `Category`, via `toContractCategory()` in
+`src/lib/categories.ts`:
+
+| Backend `category` | Contract `Category` |
+|---|---|
+| `FED`, `ECB`, `MACRO` | `Macro` |
+| `GEOPOLITICAL`, `ELECTION`, `POLITICS` | `Geopolitics` |
+| `CRYPTO` | `Crypto` |
+| `SPORTS` | `Sports` |
+| `ENTERTAINMENT` | `Culture` |
+
+The contract's `Other` has no backend category. The switch is exhaustive, and
+a unit test fails if either enum gains a member.
+
+API responses include both: `category` (backend) and `contractCategory`.
+
+### Settlement currency
+
+**Decision: `EURC` is dropped.** market-core takes exactly one collateral
+token (the USDC SAC in `deployments/testnet.json`), so a market can't settle
+in EURC. Keeping it "display-only" would label markets with a currency they
+can't trade in. A migration maps any existing `EURC` rows to `USDC` and
+removes the enum value. `settlementCurrency` stays in responses (always
+`"USDC"`) so the frontend doesn't break; the `currency` filter on
+`GET /markets` accepts only `USDC`.
+
+## Endpoints
+
+### Health
+
+`GET /health` → `{ status: "healthy", uptime: number }`
+
+### Auth (signed challenge, SEP-10 style)
+
+The old `POST /auth/connect` issued a JWT for any address it was handed, so
+anyone could log in as anyone. **It is removed.**
+
+**Why a challenge transaction rather than a signed message:** every Stellar
+wallet can `signTransaction`. `signMessage` (SEP-53) isn't universal: in
+`@creit.tech/stellar-wallets-kit` 2.5.0 the Ledger, Trezor, Albedo, Bitget,
+Klever and OneKey modules throw or report it unsupported. The challenge is
+built and verified with `WebAuth.buildChallengeTx` /
+`readChallengeTx` / `verifyChallengeTxSigners` from `@stellar/stellar-sdk`
+16.3. It is a transaction with sequence number 0 that can never be submitted
+to the network; signing it proves control of the key and spends nothing.
+
+#### `POST /auth/challenge`
+
+Rate-limited. Request:
+
+```json
+{ "address": "GABC…" }
+```
+
+`address` must pass `StrKey.isValidEd25519PublicKey`.
+
+Response `200`:
+
+```json
+{
+  "transaction": "<base64 TransactionEnvelope XDR>",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "expiresAt": "2026-10-07T15:05:00.000Z"
+}
+```
+
+The challenge is stored in Redis under its transaction hash with a 300 s TTL.
+
+Errors: `400 INVALID_ADDRESS`, `429 RATE_LIMITED`.
+
+#### `POST /auth/verify`
+
+Rate-limited. Request:
+
+```json
+{ "address": "GABC…", "signed": "<base64 XDR signed by the wallet>" }
+```
+
+The server checks, in order:
+
+1. `readChallengeTx` passes: signed by the server key, time bounds still
+   valid, home domain and web-auth domain match.
+2. The challenge's client account equals `address`.
+3. The challenge exists in Redis and is deleted atomically (`GETDEL`), so a
+   challenge works once. It's consumed even if a later check fails.
+4. `verifyChallengeTxSigners(..., [address], ...)` returns exactly
+   `[address]`.
+
+Response `200`:
+
+```json
+{ "token": "<jwt>", "userId": "<uuid>", "walletAddress": "GABC…" }
+```
+
+Errors: `400 INVALID_ADDRESS`, `400 INVALID_CHALLENGE` (malformed XDR),
+`401 CHALLENGE_EXPIRED`, `401 CHALLENGE_NOT_FOUND` (unknown or already
+used), `401 CHALLENGE_SIGNATURE_INVALID` (wrong signer, missing signature,
+address mismatch).
+
+Multisig accounts: only a signature from `address`'s own key is accepted.
+Threshold-based SEP-10 verification is a backlog item.
+
+### Markets
+
+#### Market object
+
+```json
+{
+  "id": "uuid",
+  "question": "Will …?",
+  "category": "CRYPTO",
+  "contractCategory": "Crypto",
+  "status": "ACTIVE",
+  "settlementCurrency": "USDC",
+  "initialYesProb": 0.62,
+  "currentYesProb": 0.64,
+  "confidenceInterval": { "lower": 0.55, "upper": 0.7 },
+  "totalLiquidity": 150,
+  "seedAmountRaw": "1500000000",
+  "expiryTimestamp": "2026-11-01T00:00:00.000Z",
+  "onChainMarketId": "0",
+  "creationTxHash": "a1b2…",
+  "questionHash": "64-hex",
+  "metaUri": "ipfs://bafy…",
+  "resolutionHash": "64-hex",
+  "resolutionSpec": { "kind": "signers", "threshold": 1, "disputeWindow": 3600, "signers": ["G…"] },
+  "createdAt": "…",
+  "marketUrl": null,
+  "_count": { "trades": 0, "reasoningTraces": 1, "positions": 0 }
+}
+```
+
+`onChainAddress` (Arc) is removed. Prices, reserves and on-chain status come
+from market-core; the frontend reads them directly with
+`get_market(onChainMarketId)`. `currentYesProb` and `totalLiquidity` are the
+backend's cached display values and can lag the chain.
+
+`resolutionSpec` is the revealed preimage of `resolutionHash` (ADR 0001).
+Publishing it doesn't weaken the commitment: the hash was fixed on-chain
+before trading, so the spec can't change, and anyone may reveal it to the
+resolver.
+
+#### `GET /markets`
+
+Query: `status` (`PENDING|ACTIVE|RESOLVING|RESOLVED|CANCELLED`), `category`
+(backend category), `currency` (`USDC`), `onChain` (`true` → only markets
+with an `onChainMarketId`), `page`, `limit` (≤ 100).
+Response: `Market[]`, pagination in `meta`.
+
+#### `GET /markets/:id`
+
+`:id` is the backend UUID. Response: `Market` plus up to 5 `reasoningTraces`
+previews `{ id, agentType, edge, probabilityEstimate, verified, onChainTraceId, createdAt }`.
+`404 MARKET_NOT_FOUND`.
+
+#### `GET /markets/on-chain/:onChainMarketId`
+
+Looks up the backend record for a market-core id. Same response as
+`GET /markets/:id`. `400 INVALID_MARKET_ID` unless it's a decimal `u64`
+string; `404 MARKET_NOT_FOUND`.
+
+#### `POST /markets/generate` (auth, admin, rate-limited)
+
+Starts one market-maker cycle in the background. Admin means the JWT's
+`walletAddress` is in the server's `ADMIN_ADDRESSES` allowlist; the frontend
+check is only a UI gate.
+
+Request (all optional; the current agent ignores them and picks a topic from
+live signals, which is recorded as a backlog item):
+
+```json
+{ "question": "…", "category": "CRYPTO", "expiry": "2026-11-01" }
+```
+
+Response `202`: `{ jobId, message, statusUrl, hint }`.
+Errors: `403 FORBIDDEN` (not an admin), `429 RATE_LIMITED`.
+
+#### `GET /markets/generation-status/:jobId` (auth)
+
+Response: `{ jobId, status: "RUNNING"|"COMPLETED"|"FAILED"|"UNKNOWN", startedAt, completedAt, elapsedMs, marketId?, onChainMarketId?, question?, category?, marketUrl?, error? }`.
+
+In `dry-run` mode a completed job has `onChainMarketId: null`: the creation
+was simulated, not submitted.
+
+### Reasoning traces
+
+#### Trace object
+
+```json
+{
+  "id": "uuid",
+  "marketId": "uuid",
+  "onChainMarketId": "0",
+  "agentType": "MARKET_MAKER",
+  "decisionType": "MARKET_CREATION",
+  "edge": 0.12,
+  "probabilityEstimate": 0.62,
+  "marketProbability": 0.5,
+  "confidenceInterval": { "lower": 0.55, "upper": 0.7 },
+  "verified": true,
+  "ipfsCid": "bafy…",
+  "traceHash": "64-hex",
+  "onChainTraceId": "3",
+  "publishTxHash": "…",
+  "previewSources": [{ "source": "FRED", "weight": 0.9, "signal": "…" }],
+  "market": { "question": "…", "category": "CRYPTO", "settlementCurrency": "USDC" },
+  "createdAt": "…"
+}
+```
+
+`traceHash` is the sha256 of the exact bytes pinned to IPFS (renamed from
+`sha256Hash`, which hashed a re-serialised object). `verified` is the
+backend's last check against reasoning-registry. The frontend must still run
+its own check before rendering content (see `docs/frontend-integration.md` in
+the contracts repo).
+
+#### `GET /traces`
+
+Query: `agentType`, `marketId`, `page`, `limit`. Response: preview traces,
+pagination in `meta`.
+
+#### `GET /traces/:id` (optional auth)
+
+Without access: the preview (first two sources) plus
+`{ accessLevel: "FREE_PREVIEW", lockedFields, unlockPriceRaw, dailyPassPriceRaw }`.
+With a daily pass: the full trace and `accessLevel: "DAILY_PASS"`.
+(Previously the route never read the token, so subscribers always got the
+preview. Fixed.)
+
+#### `POST /traces/verify` (auth)
+
+Request `{ "traceId": "uuid" }`. The server reads
+`reasoning_registry.get_trace(onChainTraceId)`, fetches `ipfs_cid` through the
+gateway, hashes the exact bytes and compares them with the on-chain
+`trace_hash` (same check as `x402/trace-verification.ts`).
+
+Response:
+
+```json
+{
+  "traceId": "uuid",
+  "onChainTraceId": "3",
+  "ipfsCid": "bafy…",
+  "onChainHash": "64-hex",
+  "computedHash": "64-hex",
+  "storedHash": "64-hex",
+  "verified": true,
+  "verifiedAt": "…"
+}
+```
+
+Errors: `404 TRACE_NOT_FOUND`, `409 TRACE_NOT_PUBLISHED` (no on-chain trace
+id yet), `502 IPFS_RETRIEVAL_FAILED`, `502 CHAIN_READ_FAILED`.
+
+#### `POST /traces/:id/unlock` (auth)
+
+Daily pass only. Per-trace unlocks go through x402 (below).
+
+Request:
+
+```json
+{ "txHash": "64-hex", "amountRaw": "5000000", "type": "DAILY_PASS" }
+```
+
+`amount` (a float) is still accepted for one release and converted with
+7-decimal string maths; `amountRaw` wins when both are present. The amount is
+informational: the server uses what the transaction actually moved.
+
+The server calls Stellar RPC `getTransaction(txHash)` and grants access only
+if **all** of these hold:
+
+1. `status === "SUCCESS"`.
+2. The transaction's single operation is `invokeHostFunction` →
+   `invokeContract` on `USDC_CONTRACT_ID` with function `transfer`.
+3. Arg 0 (`from`) equals the JWT's `walletAddress`.
+4. Arg 1 (`to`) equals `PAYMENTS_RECIPIENT`.
+5. Arg 2 (`amount`, i128) ≥ the tier price in base units
+   (`DAILY_PASS_PRICE_RAW`, default `5000000` = 0.50 USDC).
+6. The hash hasn't been used before (unique `txHash` on `PaymentEvent`).
+
+There is no development bypass: an unverifiable payment never grants
+access. Tests inject a fake RPC client.
+
+Response `201`: `{ subscription, trace }`.
+Errors: `400 VALIDATION_ERROR`, `402 PAYMENT_NOT_FOUND`,
+`402 PAYMENT_FAILED`, `402 PAYMENT_WRONG_TOKEN`, `402 PAYMENT_WRONG_SENDER`,
+`402 PAYMENT_WRONG_RECIPIENT`, `402 PAYMENT_INSUFFICIENT`,
+`409 PAYMENT_ALREADY_USED`, `402 ALLOWANCE_DAILY_LIMIT`.
+
+> **Product decision for a human:** `PAYMENTS_RECIPIENT` defaults to the
+> treasury contract. The treasury's trading capital *is* its USDC balance,
+> so subscription revenue would become agent trading capital. A separate
+> revenue account is probably wanted. This is flagged in `docs/STATUS.md`
+> and not decided here.
+
+#### `GET /traces/access/allowance`, `PUT /traces/access/allowance` (auth)
+
+Unchanged. `PUT` body `{ dailyLimit: number, perTraceLimit: number, currency?: "USDC" }`
+(display USDC). Response: `SpendingAllowance | null`.
+
+#### `GET /traces/payments` (auth)
+
+The user's last 100 `PaymentEvent`s, newest first.
+
+### Per-trace unlock via x402 (not this backend)
+
+**Decision: the frontend calls the contracts repo's `x402/` service
+directly** at `NEXT_PUBLIC_X402_URL`. The backend keeps daily-pass
+subscriptions only and doesn't proxy x402.
+
+Checked against `x402/trace-api.ts`: the service exposes
+`GET /traces/:traceId`, where `:traceId` is the **on-chain** reasoning-registry
+id (`onChainTraceId`), behind `@x402/express` `paymentMiddleware` with the
+`exact` Stellar scheme. On payment it fetches the IPFS content, checks the
+hash against the on-chain record, and returns
+`{ traceId, traceHash, content }`. x402 is built so the client pays the
+resource server, and a proxy would have to re-sign or forward payment
+headers for no benefit.
+
+Not verified: the contracts repo has no known x402-on-Stellar facilitator URL
+(its `docs/STATUS.md`), so a full paid round-trip has never run.
+
+### Portfolio
+
+#### `GET /portfolio`
+
+The agent's (treasury's) portfolio. Response:
+`{ totalUsdc, deployedCapital, availableCapital, openPositions, totalPnl, dailyPnl, builderFeesEarned, correlationRisk, availableCapitalRaw }`.
+`availableCapitalRaw` is `treasury.available_capital()` read live (`null` if
+the RPC read fails). The float fields are the DB's view.
+
+#### `GET /portfolio/positions`
+
+Query `status`, `page`, `limit`. Response: `Position[]` with
+`market { question, category, settlementCurrency, expiryTimestamp, onChainMarketId }`
+and `trade { direction, amount, edgeDetected, kellyFraction, txHash }`.
+
+#### `GET /portfolio/stats`
+
+Platform counts from the database only:
+`{ subscriberCount, totalCopyVolume, builderFees, marketCount, onChainMarketCount, traceCount }`.
+The version in the unpushed commit `207464d` padded these with constants
+(`+1284` subscribers, `+142000` volume); this one doesn't.
+
+### Copy trade
+
+The user signs `market_core.buy` in their own wallet. The backend records
+intent and the resulting hash; it never trades for the user.
+
+#### `POST /trade/copy` (auth)
+
+Request `{ traceId: uuid, marketId: uuid, amountRaw: "10000000" }`.
+Response:
+
+```json
+{
+  "copyTradeId": "uuid",
+  "transactionPayload": {
+    "contractId": "C… (market-core)",
+    "onChainMarketId": "0",
+    "outcome": "Yes",
+    "collateralInRaw": "10000000",
+    "userWallet": "G…",
+    "traceReference": "bafy…"
+  },
+  "instructions": "Quote, then sign market_core.buy with min_shares_out from the quote."
+}
+```
+
+The direction comes from the trace's edge. The server refuses when there's
+no trace, the edge is zero, or the market has no `onChainMarketId`
+(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`). `min_shares_out` isn't in the
+payload because it must come from a quote taken right before signing.
+
+#### `PATCH /trade/copy/:id/confirm` (auth)
+
+Request `{ txHash }`. Stored as `EXECUTED`; the indexer reconciles it against
+the market-core `trade` event.
+
+### Oracle / resolution
+
+Outcomes are decided on-chain by the `resolver` contract (Reflector price
+specs or signer attestations, then `finalize_*`). **The backend never
+decides an outcome.**
+
+- `POST /oracle/resolve` is **removed**. It let any logged-in user resolve
+  any market.
+
+#### `GET /oracle/markets/:marketId/resolution`
+
+`:marketId` is the backend UUID. Reads `resolver.state(onChainMarketId)` and
+`market_core.get_market(onChainMarketId).status` live:
+
+```json
+{
+  "marketId": "uuid",
+  "onChainMarketId": "0",
+  "resolverState": "Unconfigured" ,
+  "marketStatus": { "tag": "Resolved", "outcome": "Yes" },
+  "resolutionHash": "64-hex",
+  "resolutionSpec": { },
+  "dbStatus": "RESOLVED"
+}
+```
+
+`resolverState` is `Unconfigured | SignersPending | Finalized`.
+`marketStatus.tag` is `Open | Resolved | Void`. `404 MARKET_NOT_FOUND`,
+`409 MARKET_NOT_ON_CHAIN`, `502 CHAIN_READ_FAILED`.
+
+## Realtime (socket.io)
+
+Same origin as the API without `/api/v1`. The frontend listens to these
+events; event names are unchanged.
+
+**Finding:** before this port the backend never emitted either event (there
+is no `io.emit` anywhere in `src/`), so these listeners received nothing. The
+indexer now emits them.
+
+### `TRADE_EXECUTED`
+
+Emitted when the indexer stores a market-core `trade` event.
+
+```json
+{
+  "onChainMarketId": "0",
+  "marketId": "uuid or null",
+  "marketQuestion": "… or null",
+  "trader": "G…",
+  "direction": "YES",
+  "isBuy": true,
+  "collateralRaw": "10000000",
+  "sharesRaw": "15873015",
+  "feeRaw": "200000",
+  "priceYesBps": 6421,
+  "txHash": "64-hex",
+  "ledger": 123456,
+  "eventId": "0000…-0000000001"
+}
+```
+
+The old payload had `amount` (float USDC), `price` (0–1) and `probChange`
+(string). Frontends derive display values from `collateralRaw` and
+`priceYesBps`.
+
+### `REASONING_PUBLISHED`
+
+Emitted when the indexer stores a reasoning-registry publish event.
+
+```json
+{
+  "onChainTraceId": "3",
+  "onChainMarketId": "0",
+  "traceId": "uuid or null",
+  "agent": "G…",
+  "action": "buy",
+  "ipfsCid": "bafy…",
+  "traceHash": "64-hex",
+  "txHash": "64-hex",
+  "ledger": 123456
+}
+```
+
+## Frontend call map
+
+Every call in the frontend's `lib/api/*.ts` and where it lands:
+
+| Frontend function | Endpoint |
+|---|---|
+| `requestChallenge` / `verifyChallenge` (`auth.ts`) | `POST /auth/challenge`, `POST /auth/verify` |
+| ~~`connectWalletToBackend`~~ | ~~`POST /auth/connect`~~ (removed) |
+| `listMarkets` | `GET /markets` |
+| `getMarket` | `GET /markets/:id` |
+| `getMarketByOnChainId` | `GET /markets/on-chain/:onChainMarketId` |
+| `triggerMarketGeneration` | `POST /markets/generate` |
+| `getMarketGenerationStatus` | `GET /markets/generation-status/:jobId` |
+| `getPortfolio` | `GET /portfolio` |
+| `getPositions` | `GET /portfolio/positions` |
+| `getPlatformStats` | `GET /portfolio/stats` |
+| `initiateCopyTrade` | `POST /trade/copy` |
+| `confirmCopyTrade` | `PATCH /trade/copy/:id/confirm` |
+| `listTraces` | `GET /traces` |
+| `getTrace` | `GET /traces/:id` |
+| `verifyTrace` | `POST /traces/verify` |
+| `unlockTrace` | `POST /traces/:id/unlock` (daily pass) |
+| `getSpendingAllowance` / `setSpendingAllowance` | `GET` / `PUT /traces/access/allowance` |
+| `getPaymentEvents` | `GET /traces/payments` |
+| `getResolution` | `GET /oracle/markets/:marketId/resolution` |
+| per-trace unlock | x402 `GET {X402_URL}/traces/:onChainTraceId` |
