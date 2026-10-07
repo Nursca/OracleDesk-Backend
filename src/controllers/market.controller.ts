@@ -8,6 +8,9 @@ import { runMarketMakerCycle } from '../agents/market-maker.agent';
 import { generateMarketSchema, listMarketsSchema } from '../validators/market.validator';
 import { toContractCategory } from '../lib/categories';
 import { parseU64 } from '../lib/amounts';
+import { getOnChainMarket, printable } from '../services/chain.service';
+import { marketStatusView } from '../services/oracle.service';
+import { priceYesBps } from '../generated/fpmm';
 import {
   MarketCategory,
   MarketStatus,
@@ -389,5 +392,27 @@ export async function getMarketGenerationStatus(
 
     hint:
       'Filter GET /api/v1/markets by recent createdAt timestamps.',
+  });
+}
+
+/**
+ * GET /markets/on-chain/:onChainMarketId/state
+ * market_core.get_market read live from the network, plus yesBps computed
+ * with the contract's own FPMM math. No database involved.
+ */
+export async function getOnChainMarketState(req: Request, res: Response): Promise<void> {
+  const raw = String(req.params.onChainMarketId);
+  const onChainMarketId = parseU64(raw);
+  if (onChainMarketId === null) {
+    sendError(res, 400, 'INVALID_MARKET_ID', 'onChainMarketId must be a decimal u64');
+    return;
+  }
+  const market = await getOnChainMarket(onChainMarketId);
+  sendSuccess(res, {
+    onChainMarketId: raw,
+    ...(printable({ ...market, status: undefined, category: market.category.tag }) as object),
+    status: marketStatusView(market.status),
+    yesBps: Number(priceYesBps(market.reserve_yes, market.reserve_no)),
+    source: 'chain',
   });
 }

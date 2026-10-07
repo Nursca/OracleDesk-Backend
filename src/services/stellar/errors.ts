@@ -11,16 +11,23 @@ const TABLES: Record<string, Record<number, { message: string }>> = {
   reasoningRegistry: ReasoningRegistryErrors,
 };
 
-/** Name of a contract error, e.g. "SlippageExceeded", from an Err or a raw host error string. */
-export function contractErrorName(contract: keyof typeof TABLES, err: unknown): string | null {
+/**
+ * Name of a contract error, e.g. "SlippageExceeded".
+ *
+ * The SDK's `Err` takes its message from the spec's doc strings, which are
+ * empty for these contracts, so the reliable source is the "Error(Contract,
+ * #N)" code in the simulation/host error text, looked up in the binding's
+ * `Errors` table.
+ */
+export function contractErrorName(contract: keyof typeof TABLES, err: unknown, hostErrorText?: string): string | null {
+  const text = [hostErrorText ?? '', err instanceof Error ? err.message : String(err)].join(' ');
+  const match = text.match(/Error\(Contract, #(\d+)\)/);
+  if (match) return TABLES[contract][Number(match[1])]?.message ?? `ContractError${match[1]}`;
   if (err && typeof err === 'object' && 'error' in err) {
     const inner = (err as { error?: { message?: string } }).error;
     if (inner?.message) return inner.message;
   }
-  const text = err instanceof Error ? err.message : String(err);
-  const match = text.match(/Error\(Contract, #(\d+)\)/);
-  if (!match) return null;
-  return TABLES[contract][Number(match[1])]?.message ?? `ContractError${match[1]}`;
+  return null;
 }
 
 export class ChainError extends AppError {

@@ -207,6 +207,35 @@ Looks up the backend record for a market-core id. Same response as
 `GET /markets/:id`. `400 INVALID_MARKET_ID` unless it's a decimal `u64`
 string; `404 MARKET_NOT_FOUND`.
 
+#### `GET /markets/on-chain/:onChainMarketId/state`
+
+`market_core.get_market` read live from the network (no database), plus
+`yesBps` from the contract's FPMM math:
+
+```json
+{
+  "onChainMarketId": "0",
+  "category": "Macro",
+  "close_time": "1789998457",
+  "creator": "C…",
+  "fee_bps": 100,
+  "fees_accrued": "1000000",
+  "lp_claimed": false,
+  "meta_uri": "ipfs://…",
+  "question_hash": "64-hex",
+  "reserve_no": "1599000000",
+  "reserve_yes": "1407129456",
+  "resolution_hash": "64-hex",
+  "sets_minted": "1599000000",
+  "status": { "tag": "Resolved", "outcome": "Yes" },
+  "yesBps": 5319,
+  "source": "chain"
+}
+```
+
+`502 CHAIN_ERROR` with `details.contractError: "MarketNotFound"` for an
+unknown id.
+
 #### `POST /markets/generate` (auth, admin, rate-limited)
 
 Starts one market-maker cycle in the background. Admin means the JWT's

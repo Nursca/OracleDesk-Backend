@@ -3,6 +3,7 @@ import {
   listMarkets,
   getMarket,
   getMarketByOnChainId,
+  getOnChainMarketState,
   triggerMarketGeneration,
   getMarketGenerationStatus,
 } from '../controllers/market.controller';
@@ -14,6 +15,7 @@ const router = Router();
 // Public — no auth needed
 router.get('/', listMarkets);
 router.get('/on-chain/:onChainMarketId', getMarketByOnChainId);
+router.get('/on-chain/:onChainMarketId/state', getOnChainMarketState);
 
 // Admin only: each run calls paid LLM APIs and the treasury.
 router.post('/generate', generateLimiter, requireAuth, requireAdmin, triggerMarketGeneration);

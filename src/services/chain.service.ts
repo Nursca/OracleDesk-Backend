@@ -38,16 +38,18 @@ export const Outcomes = {
 
 /** Value from a simulated call, unwrapping contract `Result`s into ChainErrors. */
 export function simulatedValue<T>(contract: ContractKey, method: string, tx: AssembledTransaction<unknown>): T {
+  const sim = tx.simulation as { error?: string } | undefined;
+  const hostError = typeof sim?.error === 'string' ? sim.error : undefined;
   let raw: unknown;
   try {
     raw = tx.result;
   } catch (err) {
-    throw new ChainError(`${method} simulation failed`, contractErrorName(contract, err), { method });
+    throw new ChainError(`${method} simulation failed`, contractErrorName(contract, err, hostError), { method });
   }
   if (raw && typeof raw === 'object' && 'isOk' in raw && typeof (raw as { isOk: unknown }).isOk === 'function') {
     const result = raw as { isOk(): boolean; unwrap(): T };
     if (!result.isOk()) {
-      const name = contractErrorName(contract, raw);
+      const name = contractErrorName(contract, raw, hostError);
       throw new ChainError(`${method} failed: ${name ?? 'contract error'}`, name, { method });
     }
     return result.unwrap();
