@@ -10,10 +10,8 @@ git clone --recurse-submodules https://github.com/OracleDesk/OracleDesk-Backend.
 cd OracleDesk-Backend
 nvm use                      # Node 22 (see .nvmrc)
 npm ci
-docker run -d --name oracledesk-pg -e POSTGRES_USER=oracledesk -e POSTGRES_PASSWORD=oracledesk \
-  -e POSTGRES_DB=oracledesk -p 127.0.0.1:5433:5432 postgres:16-alpine
-docker run -d --name oracledesk-redis -p 127.0.0.1:6379:6379 redis:7-alpine
-cp .env.example .env         # set DATABASE_URL=postgresql://oracledesk:oracledesk@127.0.0.1:5433/oracledesk
+docker compose up -d         # local Postgres (127.0.0.1:5433) and Redis (6379)
+cp .env.example .env         # works as-is with the Compose services
 npx prisma migrate dev
 npm run dev
 ```

@@ -1,0 +1,24 @@
+# Local Postgres and Redis for development only. Credentials are local
+# throwaway values, not secrets: the ports are bound to 127.0.0.1.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: oracledesk
+      POSTGRES_PASSWORD: oracledesk
+      POSTGRES_DB: oracledesk
+    ports: ["127.0.0.1:5433:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "oracledesk"]
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+volumes:
+  pgdata:

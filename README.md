@@ -34,7 +34,8 @@ More detail in [docs/architecture.md](docs/architecture.md).
 ## Prerequisites
 
 - Node.js 22 LTS (`.nvmrc`). Built and tested here with Node 24.13.1 and npm 11.8.0; CI uses Node 22.
-- PostgreSQL 16 and Redis 7 (Docker is easiest; see below).
+- npm 10 or later.
+- Docker with Compose, for the local PostgreSQL 16 and Redis 7 in `docker-compose.yml` (or your own servers).
 - Optional: LLM keys (Anthropic or Gemini) for market generation, Pinata credentials for IPFS pinning, and NewsAPI or FRED credentials for news and macro signals. The server boots without them.
 - Optional: the [Stellar CLI](https://developers.stellar.org/docs/tools/cli) 27+ to cross-check contract state.
 
@@ -42,27 +43,45 @@ More detail in [docs/architecture.md](docs/architecture.md).
 
 ```bash
 git clone --recurse-submodules https://github.com/OracleDesk/OracleDesk-Backend.git
-cd OracleDesk-Backend && nvm use && npm ci
-git submodule update --init && npm run sync:contracts   # no-op unless the submodule moved
-docker run -d --name oracledesk-pg -e POSTGRES_USER=oracledesk -e POSTGRES_PASSWORD=oracledesk -e POSTGRES_DB=oracledesk -p 127.0.0.1:5433:5432 postgres:16-alpine
-docker run -d --name oracledesk-redis -p 127.0.0.1:6379:6379 redis:7-alpine
-cp .env.example .env    # set DATABASE_URL=postgresql://oracledesk:oracledesk@127.0.0.1:5433/oracledesk
+cd OracleDesk-Backend
+git submodule update --init      # if you cloned without --recurse-submodules
+nvm use
+npm ci
+npm run sync:contracts           # no-op unless the submodule moved
+docker compose up -d             # Postgres on 127.0.0.1:5433, Redis on 6379
+cp .env.example .env             # works as-is with the Compose services
 npx prisma migrate dev
-npm run dev             # http://localhost:8000
-scripts/smoke.sh        # in another terminal
+npm run dev                      # http://localhost:8000
 ```
 
-With an empty `JWT_SECRET` / `AUTH_SIGNING_SECRET` the server generates throwaway ones per process and warns; set real ones for anything shared.
+Then, in another terminal, `scripts/smoke.sh` checks health, wallet login with a throwaway key, the market list and a live testnet read.
+
+The server boots without LLM, Pinata or data-source keys; market generation and IPFS pinning fail until you add them. With an empty `JWT_SECRET` / `AUTH_SIGNING_SECRET` it generates throwaway ones per process and warns, so set real ones for anything shared.
 
 ## Configuration
 
-Every variable is listed and explained in [.env.example](.env.example) and validated at startup by `src/config/index.ts`; a bad or missing value stops the server with the variable's name.
+All variables are listed and explained in [.env.example](.env.example). Everything defaults to Stellar Testnet and the contract ids in the synced deployments file. Config is validated at startup by `src/config/index.ts`; a bad or missing value stops the server with the variable's name. Never commit `.env`.
 
 Key switches:
 
 - `CHAIN_EXECUTION_MODE=dry-run` (default): every contract write is built and simulated, logged, and never signed. `live` signs with `AGENT_SECRET_KEY` and is refused on any network but testnet.
 - `PAYMENTS_RECIPIENT`: where daily-pass payments must go. Defaults to the treasury contract; see [docs/STATUS.md](docs/STATUS.md) before relying on that.
 - `ADMIN_ADDRESSES`: G-addresses allowed to trigger market generation.
+
+## API at a glance
+
+The full contract with the frontend, including request and response shapes, error codes and the socket.io payloads, is [docs/api.md](docs/api.md). All routes are under `/api/v1` and return `{ ok, data, error, meta? }`. On-chain ids are decimal strings, and on-chain amounts are 7-decimal base-unit strings ending in `Raw`.
+
+| Area | Endpoints |
+|---|---|
+| Health | `GET /health` |
+| Auth | `POST /auth/challenge`, `POST /auth/verify` (signed challenge transaction → JWT) |
+| Markets | `GET /markets`, `GET /markets/:id`, `GET /markets/on-chain/:onChainMarketId`, `GET /markets/on-chain/:onChainMarketId/state` (live from the chain), `POST /markets/generate` (admin), `GET /markets/generation-status/:jobId` |
+| Traces | `GET /traces`, `GET /traces/:id`, `POST /traces/verify`, `POST /traces/:id/unlock` (daily pass, verified on-chain), `GET`/`PUT /traces/access/allowance`, `GET /traces/payments` |
+| Portfolio | `GET /portfolio`, `GET /portfolio/positions`, `GET /portfolio/stats` |
+| Copy trade | `POST /trade/copy`, `PATCH /trade/copy/:id/confirm` |
+| Resolution | `GET /oracle/markets/:marketId/resolution` (read-only; outcomes are decided on-chain) |
+| Realtime | socket.io events `TRADE_EXECUTED`, `REASONING_PUBLISHED` (from the indexer) |
 
 ## Scripts
 
@@ -75,6 +94,7 @@ Key switches:
 | `npm run check:contracts` | Fail if `src/generated/` is stale (CI runs this) |
 | `npm run prisma:migrate` | `prisma migrate dev` |
 | `scripts/smoke.sh` | Smoke test a running server (health, login, markets, live chain read) |
+| `docker compose up -d` / `down` | Start / stop local Postgres and Redis |
 
 ## Project structure
 
@@ -91,6 +111,7 @@ src/
 prisma/          Schema and forward-only migrations
 tests/           node:test suites and fixtures
 scripts/         sync-contracts.mjs, smoke.sh
+docker-compose.yml  Local Postgres and Redis
 contracts/       OracleDesk-SmartContract submodule (pinned)
 docs/            API contract, architecture, porting notes, status, backlog
 ```
