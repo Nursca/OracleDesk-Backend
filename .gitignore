@@ -6,3 +6,8 @@ node_modules
 dist-tests
 
 recovery.dat
+
+# Build output and local artefacts
+dist/
+*.log
+.DS_Store
