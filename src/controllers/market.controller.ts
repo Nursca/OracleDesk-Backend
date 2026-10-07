@@ -5,7 +5,9 @@ import type { JobRecord } from '../types';
 import { JobStatus } from '../types';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { runMarketMakerCycle } from '../agents/market-maker.agent';
-import { listMarketsSchema } from '../validators/market.validator';
+import { generateMarketSchema, listMarketsSchema } from '../validators/market.validator';
+import { toContractCategory } from '../lib/categories';
+import { parseU64 } from '../lib/amounts';
 import {
   MarketCategory,
   MarketStatus,
@@ -16,6 +18,28 @@ import { AppError } from '../middlewares/error.middleware';
 
 
 const jobTracker: Map<string, JobRecord> = new Map();
+
+/** Adds the contract category. BigInts are stringified by the app's JSON replacer. */
+function serializeMarket<T extends { category: MarketCategory }>(market: T) {
+  return { ...market, contractCategory: toContractCategory(market.category) };
+}
+
+const marketDetailInclude = {
+  reasoningTraces: {
+    orderBy: { createdAt: 'desc' as const },
+    take: 5,
+    select: {
+      id: true,
+      agentType: true,
+      edge: true,
+      probabilityEstimate: true,
+      verified: true,
+      onChainTraceId: true,
+      createdAt: true,
+    },
+  },
+  _count: { select: { trades: true, positions: true, reasoningTraces: true } },
+};
 
 // Prune completed/failed jobs older than 1 hour to prevent unbounded Map growth
 const JOB_RETENTION_MS = 60 * 60 * 1000;
@@ -57,6 +81,7 @@ export async function listMarkets(
     status,
     category,
     currency,
+    onChain,
     page: p,
     limit: l,
   } = parsed.data.query;
@@ -81,6 +106,9 @@ export async function listMarkets(
           currency as SettlementCurrency,
       }
     : {}),
+
+  ...(onChain === 'true' ? { onChainMarketId: { not: null } } : {}),
+  ...(onChain === 'false' ? { onChainMarketId: null } : {}),
 };
 
   const [markets, total] = await Promise.all([
@@ -106,7 +134,7 @@ export async function listMarkets(
 
   sendSuccess(
     res,
-    markets,
+    markets.map(serializeMarket),
     200,
     buildPaginationMeta(page, limit, total) as any,
   );
@@ -123,35 +151,7 @@ export async function getMarket(
 ): Promise<void> {
   const id = String(req.params.id);
 
-  const market = await prisma.market.findUnique({
-    where: { id },
-
-    include: {
-      reasoningTraces: {
-        orderBy: {
-          createdAt: 'desc',
-        },
-
-        take: 5,
-
-        select: {
-          id: true,
-          agentType: true,
-          edge: true,
-          probabilityEstimate: true,
-          verified: true,
-          createdAt: true,
-        },
-      },
-
-      _count: {
-        select: {
-          trades: true,
-          positions: true,
-        },
-      },
-    },
-  });
+  const market = await prisma.market.findUnique({ where: { id }, include: marketDetailInclude });
 
   if (!market) {
     sendError(
@@ -164,7 +164,26 @@ export async function getMarket(
     return;
   }
 
-  sendSuccess(res, market);
+  sendSuccess(res, serializeMarket(market));
+}
+
+/**
+ * GET /markets/on-chain/:onChainMarketId
+ * Backend record for a market-core market id.
+ */
+export async function getMarketByOnChainId(req: Request, res: Response): Promise<void> {
+  const raw = String(req.params.onChainMarketId);
+  const onChainMarketId = parseU64(raw);
+  if (onChainMarketId === null) {
+    sendError(res, 400, 'INVALID_MARKET_ID', 'onChainMarketId must be a decimal u64');
+    return;
+  }
+  const market = await prisma.market.findUnique({ where: { onChainMarketId }, include: marketDetailInclude });
+  if (!market) {
+    sendError(res, 404, 'MARKET_NOT_FOUND', `No backend market for on-chain id ${raw}`);
+    return;
+  }
+  sendSuccess(res, serializeMarket(market));
 }
 
 /**
@@ -177,6 +196,12 @@ export async function triggerMarketGeneration(
   req: Request,
   res: Response,
 ): Promise<void> {
+  const body = generateMarketSchema.safeParse(req.body);
+  if (!body.success) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'Invalid generation parameters', body.error.flatten().fieldErrors as any);
+    return;
+  }
+
   const jobId = uuidv4();
 
   // Prune old jobs to keep memory bounded
@@ -223,6 +248,7 @@ export async function triggerMarketGeneration(
         completedAt: new Date(),
 
         marketId: result?.marketId,
+        onChainMarketId: result?.onChainMarketId ?? null,
         question: result?.question,
         category: result?.category,
       });
@@ -304,6 +330,7 @@ export async function getMarketGenerationStatus(
       ...(job.marketId
         ? {
             marketId: job.marketId,
+            onChainMarketId: job.onChainMarketId ?? null,
             question: job.question,
             category: job.category,
             marketUrl: `/api/v1/markets/${job.marketId}`,

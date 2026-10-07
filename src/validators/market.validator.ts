@@ -13,7 +13,7 @@ export const createMarketSchema = z.object({
   body: z.object({
     question: z.string().min(10, 'Question must be at least 10 characters'),
     category: z.enum(MARKET_CATEGORIES),
-    settlementCurrency: z.enum(['USDC', 'EURC']).default('USDC'),
+    settlementCurrency: z.literal('USDC').default('USDC'),
     expiryTimestamp: z.number().int().positive(),
     resolutionOracle: z.string().optional(),
     minimumLiquidity: z.number().positive().default(100),
@@ -24,7 +24,8 @@ export const listMarketsSchema = z.object({
   query: z.object({
     status: z.enum(['PENDING', 'ACTIVE', 'RESOLVING', 'RESOLVED', 'CANCELLED']).optional(),
     category: z.enum(MARKET_CATEGORIES).optional(),
-    currency: z.enum(['USDC', 'EURC']).optional(),
+    currency: z.literal('USDC').optional(),
+    onChain: z.enum(['true', 'false']).optional(),
     page: z.string().optional(),
     limit: z.string().optional(),
   }),
@@ -32,3 +33,9 @@ export const listMarketsSchema = z.object({
 
 export type CreateMarketInput = z.infer<typeof createMarketSchema>['body'];
 export type MarketCategoryValue = typeof MARKET_CATEGORIES[number];
+
+export const generateMarketSchema = z.object({
+  question: z.string().min(10).max(300).optional(),
+  category: z.enum(MARKET_CATEGORIES).optional(),
+  expiry: z.string().optional(),
+}).optional();

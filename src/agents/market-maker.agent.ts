@@ -5,18 +5,17 @@ import {
   createMarketFromProposal,
 } from '../services/market.service';
 import { generateReasoningTrace } from '../services/reasoning.service';
-import { uploadTraceToIPFS } from '../services/ipfs.service';
-import { deployMarket } from '../services/chain.service';
+import { createMarketOnChain } from '../services/market-chain.service';
+import { pinAndPublishTrace } from '../services/trace-publish.service';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
-import { config } from '../config';
-import { keccak256, toBytes } from 'viem';
 
 // Return shape used by the job tracker
 export interface MarketCycleResult {
   marketId: string;
   question: string;
   category: string;
+  onChainMarketId: string | null;
 }
 
 /**
@@ -40,12 +39,12 @@ export async function runMarketMakerCycle(): Promise<MarketCycleResult | null> {
       return null;
     }
 
-    // Step 2: Generate market proposal via Gemini
+    // Step 2: Generate market proposal via the LLM
     let proposal;
     try {
       proposal = await generateMarketQuestion(signals);
     } catch (err) {
-      logger.error({ err }, 'Market Maker Agent: Gemini market generation failed');
+      logger.error({ err }, 'Market Maker Agent: market generation failed');
       return null;
     }
 
@@ -57,11 +56,21 @@ export async function runMarketMakerCycle(): Promise<MarketCycleResult | null> {
       return null;
     }
 
-    // Step 4: Persist market to DB
+    // Step 4: Persist market to DB (PENDING until it exists on-chain)
     const market = await createMarketFromProposal(proposal);
     logger.info({ marketId: market.id, category: market.category }, 'Market Maker Agent: market created in DB');
 
-    // Step 5: Generate reasoning trace for this creation decision
+    // Step 5: Commit the resolution spec and create the market through the
+    // treasury. dry-run simulates; the market then stays PENDING.
+    let onChainMarketId: bigint | null = null;
+    try {
+      const result = await createMarketOnChain(market);
+      if (result.mode === 'live') onChainMarketId = result.value;
+    } catch (err) {
+      logger.error({ err, marketId: market.id }, 'Market Maker Agent: on-chain creation failed; market stays PENDING');
+    }
+
+    // Step 6: Reasoning trace for the creation decision
     const { trace, tracePayload } = await generateReasoningTrace({
       marketId:            market.id,
       agentType:           'MARKET_MAKER',
@@ -78,66 +87,25 @@ export async function runMarketMakerCycle(): Promise<MarketCycleResult | null> {
       confidenceInterval:  proposal.confidence_interval,
     });
 
-    // Step 6: Pin trace to IPFS (CRITICAL for deployment)
-    let ipfsResult;
+    // Step 7: Pin the trace and publish its hash to reasoning-registry
     try {
-      ipfsResult = await uploadTraceToIPFS(tracePayload, trace.id);
-    } catch (err) {
-      logger.error({ err, traceId: trace.id }, 'Market Maker Agent: IPFS pin failed — cannot deploy');
-      return null;
-    }
-
-    // Step 7: Deploy to Arc via MarketFactory
-    try {
-      const txHash = await deployMarket({
-        question:              market.question,
-        expiryTimestamp:       Math.floor(market.expiryTimestamp.getTime() / 1000),
-        initialYesPriceBps:    Math.round(market.initialYesProb * 10000),
-        liquiditySeedUsdc:     market.minimumLiquidity,
-        reasoningCid:          ipfsResult.cid,
-        sha256Hash:            ipfsResult.sha256Hash,
-        confidenceIntervalBps: 800, // ±8% default confidence
+      await pinAndPublishTrace({
+        traceId: trace.id,
+        payload: { ...tracePayload, onChainMarketId: onChainMarketId?.toString() ?? null },
+        action: 'create_market',
+        onChainMarketId,
       });
-
-      logger.info({ marketId: market.id, txHash }, 'Market Maker Agent: market deployment submitted to Arc');
-
-      // Derive a deterministic mock on-chain address in non-production environments.
-      // In production the blockchain indexer watches for the real MarketCreated event
-      // and sets onChainAddress once the tx is mined.  In dev/mock mode no real event
-      // ever fires, so we simulate it here so the market is immediately resolvable.
-      const isMockMode = config.CHAIN_EXECUTION_MODE === 'mock' || config.NODE_ENV !== 'production';
-      const mockOnChainAddress = isMockMode
-        ? `0x${keccak256(toBytes(`onchain:${market.id}`)).slice(26)}` // last 20 bytes → valid address length
-        : null;
-
-      await prisma.market.update({
-        where: { id: market.id },
-        data: {
-          txHash,
-          ...(mockOnChainAddress
-            ? { onChainAddress: mockOnChainAddress, status: 'ACTIVE' }
-            : {}),
-        },
-      });
-
-      if (mockOnChainAddress) {
-        logger.info(
-          { marketId: market.id, onChainAddress: mockOnChainAddress },
-          'Market Maker Agent: mock on-chain address assigned (dev mode)',
-        );
-      }
     } catch (err) {
-      logger.error({ err, marketId: market.id }, 'Market Maker Agent: Arc deployment failed');
-      // We keep it PENDING in DB, could be retried later
+      logger.error({ err, traceId: trace.id }, 'Market Maker Agent: trace pin/publish failed');
     }
 
     logger.info({ marketId: market.id, traceId: trace.id }, 'Market Maker Agent: cycle complete');
 
-    // ← Return the created market details for the job tracker
     return {
       marketId: market.id,
       question: market.question,
       category: String(market.category),
+      onChainMarketId: onChainMarketId?.toString() ?? null,
     };
   } catch (err) {
     logger.error({ err }, 'Market Maker Agent: unhandled cycle error');

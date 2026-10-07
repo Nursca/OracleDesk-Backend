@@ -83,10 +83,9 @@ export interface TradePayload {
   price: number;
   kellyFraction: number;
   edgeDetected: number;
-  builderCode: string;
   traceId?: string;
-  polymarketTokenId?: string;
-  polymarketConditionId?: string;
+  /** Trace document to pin and publish once the trade is on-chain. */
+  tracePayload?: Record<string, unknown>;
 }
 
 export interface CopyTradePayload {
@@ -122,9 +121,11 @@ export interface TraceInput {
 
 export interface TraceVerification {
   traceId: string;
+  onChainTraceId: string;
   ipfsCid: string;
-  storedHash: string;
+  onChainHash: string;
   computedHash: string;
+  storedHash: string | null;
   verified: boolean;
   verifiedAt: Date;
 }
@@ -164,15 +165,6 @@ export interface HedgeRecommendation {
   rationale: string;
 }
 
-// ─── Event indexer types ───
-export interface ChainEvent {
-  eventName: string;
-  blockNumber: bigint;
-  txHash: string;
-  args: Record<string, unknown>;
-  logIndex: number;
-}
-
 // ─── API response types ───
 export interface ApiResponse<T = unknown> {
   ok: boolean;
@@ -207,6 +199,7 @@ export interface JobRecord {
   startedAt: Date;
   completedAt?: Date;
   marketId?: string;
+  onChainMarketId?: string | null;
   question?: string;
   category?: MarketCategory;
   error?: string;

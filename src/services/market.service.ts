@@ -21,7 +21,7 @@ const marketProposalSchema = z.object({
   initial_yes_probability: z.number().min(0.01).max(0.99),
   resolution_oracle:       z.string().min(1),
   expiry_timestamp:        z.number().int().positive(),
-  settlement_currency:     z.enum(["USDC", "EURC"]),
+  settlement_currency:     z.literal("USDC").catch("USDC"),
   minimum_liquidity_usdc:  z.number().positive().default(100),
   category: z.enum([
     "FED", "ECB", "ELECTION", "GEOPOLITICAL",
@@ -92,9 +92,8 @@ REQUIRED JSON STRUCTURE:
   "reasoning": "A maximum of two sentences explaining this probability estimate"
 }
 
-CURRENCY ROUTING:
-- US macro / Fed / US elections / US sports / US entertainment → USDC
-- EU / ECB / EU elections / international events → EURC
+CURRENCY:
+- Every market settles in USDC.
 
 CATEGORY GUIDE:
 - FED: Federal Reserve rate decisions, FOMC meetings, Fed statements
@@ -152,7 +151,7 @@ Generate ONE high-quality binary prediction market from these signals.
 IMPORTANT: You MUST create a market on a DIFFERENT topic from the existing markets listed above.
 If all FED/rate questions are already covered, pick a different category entirely (MACRO, GEOPOLITICAL, CRYPTO, SPORTS, POLITICS, ENTERTAINMENT, etc).
 Choose the most actionable, near-term, verifiable event that is NOT already covered.
-Pick the category and currency that best fits the event.
+Pick the category that best fits the event.
 `;
 
   let rawResponse: string;
@@ -281,7 +280,7 @@ export async function createMarketFromProposal(
       question:           proposal.market_question,
       category:           finalCategory,
       status:             "PENDING",
-      settlementCurrency: proposal.settlement_currency,
+      settlementCurrency: "USDC",
       initialYesProb:     proposal.initial_yes_probability,
       currentYesProb:     proposal.initial_yes_probability,
       confidenceInterval: proposal.confidence_interval as any,

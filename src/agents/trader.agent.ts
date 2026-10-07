@@ -3,11 +3,9 @@ import { calculateProbability } from '../services/market.service';
 import { calculateKellySize, executeTrade, trackPosition, closePosition } from '../services/trade.service';
 import { checkCorrelation } from '../services/correlation.service';
 import { generateReasoningTrace } from '../services/reasoning.service';
-import { uploadTraceToIPFS } from '../services/ipfs.service';
 import { detectHedgeOpportunities, autoHedge, checkDailyDrawdown, enforceStopLoss } from '../services/hedging.service';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
-import { config } from '../config';
 
 const BANKROLL = 10_000;  // $10,000 USDC starting bankroll
 const MIN_MARKET_LIQUIDITY = 500;
@@ -159,14 +157,9 @@ async function analyzeAndTradeMarket(market: any, signals: any): Promise<void> {
       price,
       kellyFraction: kellyResult.halfKelly,
       edgeDetected:  edge,
-      builderCode:   config.POLYMARKET_BUILDER_CODE,
       traceId:       trace.id,
+      tracePayload,
     });
-
-    // Pin to IPFS async — don't block
-    uploadTraceToIPFS(tracePayload, trace.id).catch(err =>
-      logger.warn({ err }, 'Trade trace IPFS pin failed'),
-    );
 
     logger.info({ marketId: market.id, direction, amount: finalSize, edge }, 'Trader Agent: trade executed');
   } catch (err) {
