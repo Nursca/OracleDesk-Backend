@@ -1,318 +1,189 @@
-import {
-  createPublicClient,
-  createWalletClient,
-  http,
-  keccak256,
-  parseUnits,
-  toBytes,
-} from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+/**
+ * Stellar chain access for the backend.
+ *
+ * Reads go through read-only binding clients (simulation, no signer).
+ * Writes always go through the treasury (`agent_create_market`, `agent_buy`,
+ * `agent_sell`) so its on-chain risk caps apply, plus
+ * `reasoning_registry.publish_trace`. The backend never calls
+ * `market_core.buy` with the agent key.
+ *
+ * CHAIN_EXECUTION_MODE=dry-run (the default) builds and simulates every
+ * write, logs the simulated result and returns it without signing.
+ *
+ * Why not reuse agents/stellar/adapter.ts from the contracts repo: its
+ * dry-run mode returns the arguments without simulating, it imports the
+ * bindings by npm package name (not installed here), and it has no
+ * agent_sell. This service keeps the same method names and mode semantics
+ * so the two can converge (see docs/contract-requests.md).
+ */
+import type { AssembledTransaction } from '@stellar/stellar-sdk/contract';
 import { config } from '../config';
-import {
-  CONTRACT_ADDRESSES,
-  MULTISIG_ORACLE_ABI,
-  TREASURY_MANAGER_ABI,
-  MARKET_FACTORY_ABI,
-  PREDICTION_MARKET_ABI,
-  REASONING_REGISTRY_ABI,
-  POSITION_LEDGER_ABI,
-} from '../config/contracts';
-import { createCircleContractExecution } from './circle.service';
-import { AppError } from '../middlewares/error.middleware';
+import { logger } from '../lib/logger';
+import { agentClients, readClients } from './stellar/clients';
+import { ChainError, contractErrorName } from './stellar/errors';
+import type { Category, Market as OnChainMarket, Outcome, Position } from '../generated/market-core';
+import type { Trace } from '../generated/reasoning-registry';
+import type { ResolutionState } from '../generated/resolver';
 
-const arcChain = {
-  id: config.ARC_CHAIN_ID,
-  name: 'Arc Testnet',
-  network: 'arc-testnet',
-  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-  rpcUrls: { default: { http: [config.ARC_RPC_URL] } },
-} as const;
+type ContractKey = 'marketCore' | 'treasury' | 'resolver' | 'reasoningRegistry';
 
-export const arcPublicClient = createPublicClient({
-  chain: arcChain as any,
-  transport: http(config.ARC_RPC_URL),
-});
+export type WriteResult<T> =
+  | { mode: 'dry-run'; method: string; value: T; txHash: null }
+  | { mode: 'live'; method: string; value: T; txHash: string | null };
 
-export function marketIdToBytes32(marketId: string): `0x${string}` {
-  return keccak256(toBytes(marketId));
+export const Outcomes = {
+  Yes: { tag: 'Yes', values: undefined } as Outcome,
+  No: { tag: 'No', values: undefined } as Outcome,
+};
+
+/** Value from a simulated call, unwrapping contract `Result`s into ChainErrors. */
+export function simulatedValue<T>(contract: ContractKey, method: string, tx: AssembledTransaction<unknown>): T {
+  let raw: unknown;
+  try {
+    raw = tx.result;
+  } catch (err) {
+    throw new ChainError(`${method} simulation failed`, contractErrorName(contract, err), { method });
+  }
+  if (raw && typeof raw === 'object' && 'isOk' in raw && typeof (raw as { isOk: unknown }).isOk === 'function') {
+    const result = raw as { isOk(): boolean; unwrap(): T };
+    if (!result.isOk()) {
+      const name = contractErrorName(contract, raw);
+      throw new ChainError(`${method} failed: ${name ?? 'contract error'}`, name, { method });
+    }
+    return result.unwrap();
+  }
+  return raw as T;
 }
 
-/**
- * Deploys a new prediction market on Arc via MarketFactory.
- */
-export async function deployMarket(params: {
-  question: string;
-  expiryTimestamp: number;
-  initialYesPriceBps: number;
-  liquiditySeedUsdc: number;
-  reasoningCid: string;
-  sha256Hash: string;
-  confidenceIntervalBps: number;
-}): Promise<string> {
-  const liquiditySeed = parseUnits(params.liquiditySeedUsdc.toFixed(6), 6);
-  const sha256Hash = params.sha256Hash.startsWith('0x')
-    ? params.sha256Hash as `0x${string}`
-    : `0x${params.sha256Hash}` as `0x${string}`;
-
-  if (config.CHAIN_EXECUTION_MODE === 'mock') {
-    return `0x${keccak256(toBytes(`deployMarket:${params.question}:${Date.now()}`)).slice(2)}`;
-  }
-
-  if (config.CHAIN_EXECUTION_MODE === 'circle') {
-    const result = await createCircleContractExecution({
-      contractAddress: CONTRACT_ADDRESSES.marketFactory,
-      abiFunctionSignature: 'createMarket(string,address,uint256,uint256,uint256,address,string,bytes32,uint256)',
-      abiParameters: [
-        params.question,
-        CONTRACT_ADDRESSES.multiSigOracle,
-        params.expiryTimestamp,
-        params.initialYesPriceBps,
-        liquiditySeed.toString(),
-        config.AGENT_WALLET_ADDRESS,
-        params.reasoningCid,
-        sha256Hash,
-        params.confidenceIntervalBps,
-      ],
-      refId: `oracledesk-createMarket-${keccak256(toBytes(params.question))}`,
+async function read<T>(contract: ContractKey, method: string, call: () => Promise<AssembledTransaction<unknown>>): Promise<T> {
+  let tx: AssembledTransaction<unknown>;
+  try {
+    tx = await call();
+  } catch (err) {
+    throw new ChainError(`${method} read failed`, contractErrorName(contract, err), {
+      method,
+      cause: err instanceof Error ? err.message : String(err),
     });
-    return `circle:${result.transactionId}`;
   }
-
-  return writeWalletContract({
-    address: CONTRACT_ADDRESSES.marketFactory as `0x${string}`,
-    abi: MARKET_FACTORY_ABI,
-    functionName: 'createMarket',
-    args: [
-      params.question,
-      CONTRACT_ADDRESSES.multiSigOracle,
-      params.expiryTimestamp,
-      params.initialYesPriceBps,
-      liquiditySeed,
-      config.AGENT_WALLET_ADDRESS,
-      params.reasoningCid,
-      sha256Hash,
-      params.confidenceIntervalBps,
-    ],
-  });
+  return simulatedValue<T>(contract, method, tx);
 }
 
-/**
- * Executes a BUY trade on an Arc PredictionMarket contract.
- */
-export async function buyArcMarketShares(params: {
-  marketAddress: string;
-  buyYes: boolean;
-  amountUsdc: number;
-  minSharesOut?: number;
-}): Promise<string> {
-  const amount = parseUnits(params.amountUsdc.toFixed(6), 6);
-  const minShares = params.minSharesOut ?? 0;
-
-  if (config.CHAIN_EXECUTION_MODE === 'mock') {
-    return `0x${keccak256(toBytes(`buyArc:${params.marketAddress}:${params.amountUsdc}:${Date.now()}`)).slice(2)}`;
-  }
-
-  if (config.CHAIN_EXECUTION_MODE === 'circle') {
-    const result = await createCircleContractExecution({
-      contractAddress: params.marketAddress,
-      abiFunctionSignature: 'buy(bool,uint256,uint256)',
-      abiParameters: [params.buyYes, amount.toString(), minShares.toString()],
-      refId: `oracledesk-buyArc-${params.marketAddress}-${Date.now()}`,
+async function write<T>(
+  contract: 'treasury' | 'reasoningRegistry',
+  method: string,
+  args: Record<string, unknown>,
+  call: () => Promise<AssembledTransaction<unknown>>,
+): Promise<WriteResult<T>> {
+  let tx: AssembledTransaction<unknown>;
+  try {
+    tx = await call();
+  } catch (err) {
+    throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
+      method,
+      cause: err instanceof Error ? err.message : String(err),
     });
-    return `circle:${result.transactionId}`;
+  }
+  const simulated = simulatedValue<T>(contract, method, tx);
+
+  if (config.CHAIN_EXECUTION_MODE === 'dry-run') {
+    logger.info({ method, args: printable(args), simulated: printable(simulated) }, 'dry-run: simulated, not submitted');
+    return { mode: 'dry-run', method, value: simulated, txHash: null };
   }
 
-  return writeWalletContract({
-    address: params.marketAddress as `0x${string}`,
-    abi: PREDICTION_MARKET_ABI,
-    functionName: 'buy',
-    args: [params.buyYes, amount, minShares],
-  });
-}
-
-/**
- * Publishes a reasoning trace proof to the ReasoningRegistry on Arc.
- */
-export async function publishReasoningToRegistry(params: {
-  ipfsCid: string;
-  sha256Hash: string;
-  traceType: 'market_creation' | 'trade' | 'hedge' | 'pass';
-  relatedId: string; // positionId or marketId
-}): Promise<string> {
-  const sha256Hash = params.sha256Hash.startsWith('0x')
-    ? params.sha256Hash as `0x${string}`
-    : `0x${params.sha256Hash}` as `0x${string}`;
-
-  // If relatedId is a UUID, we need to format it or use a different representation
-  // ReasoningRegistry expects bytes32 for relatedId.
-  // For simplicity, we can hash the relatedId if it's not already bytes32.
-  const relatedIdBytes = params.relatedId.startsWith('0x') && params.relatedId.length === 66
-    ? params.relatedId as `0x${string}`
-    : keccak256(toBytes(params.relatedId));
-
-  if (config.CHAIN_EXECUTION_MODE === 'mock') {
-    return `0x${keccak256(toBytes(`publishReasoning:${params.ipfsCid}:${Date.now()}`)).slice(2)}`;
-  }
-
-  if (config.CHAIN_EXECUTION_MODE === 'circle') {
-    const result = await createCircleContractExecution({
-      contractAddress: CONTRACT_ADDRESSES.reasoningRegistry,
-      abiFunctionSignature: 'publishTrace(string,bytes32,string,bytes32)',
-      abiParameters: [params.ipfsCid, sha256Hash, params.traceType, relatedIdBytes],
-      refId: `oracledesk-publishReasoning-${params.ipfsCid}`,
+  try {
+    const sent = await tx.signAndSend();
+    const value = simulatedValueFromSent<T>(contract, method, sent.result);
+    const txHash = sent.sendTransactionResponse?.hash ?? null;
+    logger.info({ method, txHash }, 'submitted');
+    return { mode: 'live', method, value, txHash };
+  } catch (err) {
+    throw new ChainError(`${method} submission failed`, contractErrorName(contract, err), {
+      method,
+      cause: err instanceof Error ? err.message : String(err),
     });
-    return `circle:${result.transactionId}`;
   }
-
-  return writeWalletContract({
-    address: CONTRACT_ADDRESSES.reasoningRegistry as `0x${string}`,
-    abi: REASONING_REGISTRY_ABI,
-    functionName: 'publishTrace',
-    args: [params.ipfsCid, sha256Hash, params.traceType, relatedIdBytes],
-  });
 }
 
-export async function submitFundBet(params: {
-  marketId: string;
-  amountUsdc: number;
-}): Promise<string> {
-  const marketIdBytes = marketIdToBytes32(params.marketId);
-  const amount = parseUnits(params.amountUsdc.toFixed(6), 6);
-
-  if (config.CHAIN_EXECUTION_MODE === 'mock') {
-    return `0x${keccak256(toBytes(`fundBet:${params.marketId}:${params.amountUsdc}:${Date.now()}`)).slice(2)}`;
+function simulatedValueFromSent<T>(contract: ContractKey, method: string, result: unknown): T {
+  if (result && typeof result === 'object' && 'isOk' in result) {
+    const r = result as { isOk(): boolean; unwrap(): T };
+    if (!r.isOk()) throw new ChainError(`${method} failed`, contractErrorName(contract, result), { method });
+    return r.unwrap();
   }
-
-  if (config.CHAIN_EXECUTION_MODE === 'circle') {
-    const result = await createCircleContractExecution({
-      contractAddress: CONTRACT_ADDRESSES.treasuryManager,
-      abiFunctionSignature: 'fundBet(bytes32,uint256,uint32)',
-      abiParameters: [marketIdBytes, amount.toString(), '1000'],
-      refId: `oracledesk-fundBet-${params.marketId}`,
-    });
-    return `circle:${result.transactionId}`;
-  }
-
-  return writeWalletContract({
-    address: CONTRACT_ADDRESSES.treasuryManager as `0x${string}`,
-    abi: TREASURY_MANAGER_ABI,
-    functionName: 'fundBet',
-    args: [marketIdBytes, amount, 1000],
-  });
+  return result as T;
 }
 
-export async function submitOracleApproval(params: {
-  marketAddress: string;
-  yesWon: boolean;
-}): Promise<string> {
-  if (config.CHAIN_EXECUTION_MODE === 'mock') {
-    return `0x${keccak256(toBytes(`oracle:${params.marketAddress}:${params.yesWon}:${Date.now()}`)).slice(2)}`;
+/** JSON-safe view (bigint → string, Buffer → hex) for logs and API output. */
+export function printable(value: unknown): unknown {
+  if (typeof value === 'bigint') return value.toString();
+  if (Buffer.isBuffer(value)) return value.toString('hex');
+  if (Array.isArray(value)) return value.map(printable);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, printable(v)]));
   }
-
-  if (config.CHAIN_EXECUTION_MODE === 'circle') {
-    const result = await createCircleContractExecution({
-      contractAddress: CONTRACT_ADDRESSES.multiSigOracle,
-      abiFunctionSignature: 'approveResolution(address,bool)',
-      abiParameters: [params.marketAddress, params.yesWon],
-      refId: `oracledesk-oracle-${params.marketAddress}-${params.yesWon}`,
-    });
-    return `circle:${result.transactionId}`;
-  }
-
-  return writeWalletContract({
-    address: CONTRACT_ADDRESSES.multiSigOracle as `0x${string}`,
-    abi: MULTISIG_ORACLE_ABI,
-    functionName: 'approveResolution',
-    args: [params.marketAddress as `0x${string}`, params.yesWon],
-  });
+  return value;
 }
 
-/**
- * Records a Polymarket position on the Arc PositionLedger.
- */
-export async function openPositionOnLedger(params: {
-  conditionId: string;
-  tokenId: string;
-  side: 'YES' | 'NO';
-  usdcSpent: number;
-  entryPriceBps: number;
-  edgeBps: number;
-  reasoningCid: string;
-  sha256Hash: string;
-  polygonTxHash: string;
-}): Promise<string> {
-  const usdcSpent = parseUnits(params.usdcSpent.toFixed(6), 6);
-  const conditionId = params.conditionId.startsWith('0x') ? params.conditionId as `0x${string}` : `0x${params.conditionId}` as `0x${string}`;
-  const sha256Hash = params.sha256Hash.startsWith('0x') ? params.sha256Hash as `0x${string}` : `0x${params.sha256Hash}` as `0x${string}`;
+// ─── Reads ────────────────────────────────────────────────────────────────
 
-  if (config.CHAIN_EXECUTION_MODE === 'mock') {
-    return `0x${keccak256(toBytes(`openPosition:${params.conditionId}:${Date.now()}`)).slice(2)}`;
-  }
+export const marketCount = () =>
+  read<bigint>('marketCore', 'market_count', async () => (await readClients.marketCore()).market_count());
 
-  if (config.CHAIN_EXECUTION_MODE === 'circle') {
-    const result = await createCircleContractExecution({
-      contractAddress: CONTRACT_ADDRESSES.positionLedger,
-      abiFunctionSignature: 'openPosition(bytes32,bytes32,uint256,uint8,uint256,uint256,uint256,string,bytes32,string)',
-      abiParameters: [
-        keccak256(toBytes(Date.now().toString())), // dummy positionId
-        conditionId,
-        params.tokenId,
-        params.side === 'YES' ? 0 : 1,
-        usdcSpent.toString(),
-        params.entryPriceBps,
-        params.edgeBps,
-        params.reasoningCid,
-        sha256Hash,
-        params.polygonTxHash,
-      ],
-      refId: `oracledesk-openPosition-${params.conditionId}`,
-    });
-    return `circle:${result.transactionId}`;
-  }
+export const getOnChainMarket = (marketId: bigint) =>
+  read<OnChainMarket>('marketCore', 'get_market', async () => readClients.marketCore().get_market({ market_id: marketId }));
 
-  return writeWalletContract({
-    address: CONTRACT_ADDRESSES.positionLedger as `0x${string}`,
-    abi: POSITION_LEDGER_ABI,
-    functionName: 'openPosition',
-    args: [
-      conditionId, // Use conditionId as positionId for simplicity in this hackathon version or generate a unique one
-      params.tokenId,
-      params.side === 'YES' ? 0 : 1,
-      usdcSpent,
-      params.entryPriceBps,
-      params.edgeBps,
-      params.reasoningCid,
-      sha256Hash,
-      params.polygonTxHash,
-    ],
-  });
+export const getPrice = (marketId: bigint, outcome: Outcome) =>
+  read<number>('marketCore', 'get_price', async () => readClients.marketCore().get_price({ market_id: marketId, outcome }));
+
+export const quoteBuy = (marketId: bigint, outcome: Outcome, collateralIn: bigint) =>
+  read<bigint>('marketCore', 'quote_buy', async () =>
+    readClients.marketCore().quote_buy({ market_id: marketId, outcome, collateral_in: collateralIn }),
+  );
+
+export const getPosition = (marketId: bigint, holder: string) =>
+  read<Position>('marketCore', 'get_position', async () =>
+    readClients.marketCore().get_position({ market_id: marketId, holder }),
+  );
+
+export const getOnChainTrace = (traceId: bigint) =>
+  read<Trace>('reasoningRegistry', 'get_trace', async () => readClients.reasoningRegistry().get_trace({ trace_id: traceId }));
+
+export const resolverState = (marketId: bigint) =>
+  read<ResolutionState>('resolver', 'state', async () => readClients.resolver().state({ market_id: marketId }));
+
+export const treasuryAvailableCapital = () =>
+  read<bigint>('treasury', 'available_capital', async () => readClients.treasury().available_capital());
+
+// ─── Writes (through the treasury) ───────────────────────────────────────────
+
+export interface CreateMarketArgs {
+  question_hash: Buffer;
+  resolution_hash: Buffer;
+  meta_uri: string;
+  category: Category;
+  close_time: bigint;
+  seed_amount: bigint;
+  initial_yes_bps: number;
 }
 
-async function writeWalletContract(params: {
-  address: `0x${string}`;
-  abi: any;
-  functionName: string;
-  args: unknown[];
-}): Promise<string> {
-  if (!config.AGENT_PRIVATE_KEY) {
-    throw new AppError(500, 'AGENT_PRIVATE_KEY_MISSING', 'AGENT_PRIVATE_KEY is required for wallet execution mode');
-  }
+export const agentCreateMarket = (args: CreateMarketArgs) =>
+  write<bigint>('treasury', 'agent_create_market', { ...args }, async () =>
+    agentClients.treasury().agent_create_market(args),
+  );
 
-  const privateKey = config.AGENT_PRIVATE_KEY.startsWith('0x')
-    ? config.AGENT_PRIVATE_KEY as `0x${string}`
-    : `0x${config.AGENT_PRIVATE_KEY}` as `0x${string}`;
+export const agentBuy = (args: { market_id: bigint; outcome: Outcome; collateral_in: bigint; min_shares_out: bigint }) =>
+  write<bigint>('treasury', 'agent_buy', args, async () => agentClients.treasury().agent_buy(args));
 
-  const account = privateKeyToAccount(privateKey);
-  const walletClient = createWalletClient({
-    account,
-    chain: arcChain as any,
-    transport: http(config.ARC_RPC_URL),
-  });
+export const agentSell = (args: { market_id: bigint; outcome: Outcome; collateral_out: bigint; max_shares_in: bigint }) =>
+  write<bigint>('treasury', 'agent_sell', args, async () => agentClients.treasury().agent_sell(args));
 
-  return walletClient.writeContract({
-    address: params.address,
-    abi: params.abi,
-    functionName: params.functionName,
-    args: params.args,
-  } as any);
-}
+export const publishTrace = (args: {
+  agent: string;
+  market_id: bigint;
+  action: string;
+  trace_hash: Buffer;
+  ipfs_cid: string;
+}) =>
+  write<bigint>('reasoningRegistry', 'publish_trace', args, async () =>
+    agentClients.reasoningRegistry().publish_trace(args),
+  );
