@@ -1,25 +1,28 @@
 {
   "name": "oracledesk-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "OracleDesk backend: API, indexer and LLM pipeline for the Stellar prediction-market contracts",
   "main": "index.js",
   "scripts": {
     "build:test": "tsc -p tsconfig.test.json",
-    "test": "npm run build:test && node --test dist-tests/tests/*.test.js",
+    "test": "npm run build:test && node --test --test-concurrency=1 dist-tests/tests/*.test.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
     "start": "npm run build && node dist/server.js",
     "prisma:migrate": "prisma migrate dev",
     "prisma:generate": "prisma generate",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "sync:contracts": "node scripts/sync-contracts.mjs",
+    "check:contracts": "node scripts/sync-contracts.mjs --check"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "~0.96.0",
     "@google/generative-ai": "~0.24.1",
     "@prisma/client": "~6.19.3",
+    "@stellar/stellar-sdk": "^16.3.1",
     "axios": "~1.16.1",
     "bcrypt": "~6.0.0",
     "bullmq": "~5.76.8",
@@ -27,7 +30,6 @@
     "cors": "~2.8.6",
     "dayjs": "~1.11.20",
     "dotenv": "~17.4.2",
-    "ethers": "^6.16.0",
     "express": "~5.2.1",
     "express-rate-limit": "~8.5.2",
     "helmet": "~8.1.0",
@@ -45,8 +47,6 @@
     "prisma": "~6.19.3",
     "socket.io": "~4.8.3",
     "uuid": "~14.0.0",
-    "viem": "~2.49.2",
-    "xss-clean": "~0.1.4",
     "zod": "~4.4.3"
   },
   "devDependencies": {
