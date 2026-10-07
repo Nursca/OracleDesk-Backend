@@ -1,17 +1,14 @@
 import { Router } from 'express';
+import authRoutes      from './auth.routes';
 import marketRoutes    from './market.routes';
 import traceRoutes     from './trace.routes';
 import portfolioRoutes from './portfolio.routes';
 import tradeRoutes     from './trade.routes';
 import oracleRoutes    from './oracle.routes';
-import { connectWallet } from '../controllers/trade.controller';
 
 const router = Router();
 
-// Auth
-router.post('/auth/connect', connectWallet);
-
-// Feature routes
+router.use('/auth',      authRoutes);
 router.use('/markets',   marketRoutes);
 router.use('/traces',    traceRoutes);
 router.use('/portfolio', portfolioRoutes);
